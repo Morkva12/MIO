@@ -512,7 +512,7 @@ class CleaningWindow(QWidget):
 
     def _decide_img_source(self):
         """Определение источника изображений"""
-        # Сначала проверяем, есть ли сохраненные изображения
+        # 1. Сначала проверяем saved_images.json
         saved_config_path = os.path.join(self.chapter_paths.get("cleaning_folder", ""), "saved_images.json")
         if os.path.exists(saved_config_path):
             try:
@@ -528,7 +528,31 @@ class CleaningWindow(QWidget):
             except Exception as e:
                 logger.error(f"Ошибка при загрузке сохраненных путей: {str(e)}")
 
-        # Если не нашли сохраненных, продолжаем стандартный алгоритм
+        # 2. Если JSON не найден, проверяем папку Клининг напрямую
+        cleaning_folder = self.chapter_paths.get("cleaning_folder", "")
+        if cleaning_folder and os.path.isdir(cleaning_folder):
+            cleaned_images = []
+            for file in os.listdir(cleaning_folder):
+                if file.lower().startswith("cleaned_") and file.lower().endswith(
+                        ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
+                    cleaned_images.append(os.path.join(cleaning_folder, file))
+
+            if cleaned_images:
+                # Сортируем изображения по имени
+                cleaned_images.sort()
+                logger.info(f"Найдено {len(cleaned_images)} очищенных изображений в папке Клининг")
+
+                # Сохраняем пути в JSON для последующей загрузки
+                try:
+                    with open(saved_config_path, 'w', encoding='utf-8') as f:
+                        json.dump({"paths": cleaned_images}, f, ensure_ascii=False, indent=4)
+                    logger.info(f"Пути сохранены в {saved_config_path}")
+                except Exception as e:
+                    logger.error(f"Ошибка при сохранении путей: {str(e)}")
+
+                return cleaned_images
+
+        # 3. Если очищенных изображений нет, ищем в папках Enhanced/Originals
         e_folder = os.path.join(self.chapter_paths.get("enhanced_folder", ""), "Enhanced")
         o_folder = os.path.join(self.chapter_paths.get("enhanced_folder", ""), "Originals")
         u_folder = self.chapter_paths.get("upload_folder", "")
@@ -1158,14 +1182,50 @@ class CleaningWindow(QWidget):
 
                 # Сохраняем изображение только если успешно загружено
                 self.viewer.pixmaps[i] = pixmap
-                self.viewer.orig_pixmaps[i] = pixmap.copy()
+
+                # Определяем, является ли это очищенным изображением
+                is_cleaned = False
+                if path.startswith(self.chapter_paths["cleaning_folder"]) and "cleaned_" in os.path.basename(path):
+                    is_cleaned = True
+
+                    # Ищем оригинал в папке загрузки/Enhanced/Originals
+                    orig_name = os.path.basename(path).replace("cleaned_", "")
+                    orig_path = None
+
+                    # Проверяем в Enhanced
+                    e_path = os.path.join(self.chapter_paths["enhanced_folder"], "Enhanced", orig_name)
+                    if os.path.exists(e_path):
+                        orig_path = e_path
+
+                    # Проверяем в Originals
+                    if not orig_path:
+                        o_path = os.path.join(self.chapter_paths["enhanced_folder"], "Originals", orig_name)
+                        if os.path.exists(o_path):
+                            orig_path = o_path
+
+                    # Загружаем оригинал если нашли
+                    if orig_path:
+                        orig_pixmap = QPixmap(orig_path)
+                        if not orig_pixmap.isNull():
+                            self.viewer.orig_pixmaps[i] = orig_pixmap.copy()
+                            logger.info(f"Загружен оригинал из {orig_path}")
+                        else:
+                            # Если не удалось загрузить оригинал, используем очищенное как оригинал
+                            self.viewer.orig_pixmaps[i] = pixmap.copy()
+                    else:
+                        # Если не нашли оригинал, используем очищенное как оригинал
+                        self.viewer.orig_pixmaps[i] = pixmap.copy()
+                else:
+                    # Для не очищенных изображений - обычное копирование
+                    self.viewer.orig_pixmaps[i] = pixmap.copy()
+
                 self.viewer.page_loading_status[i] = True
 
                 # Инициализируем буфер
                 if i not in self.circ_buf:
                     self.circ_buf[i] = {
                         0: None,  # Бэкап из другого этапа
-                        1: pixmap.copy(),  # Сохраняем оригинал
+                        1: pixmap.copy(),  # Сохраняем текущее изображение как базовое
                         2: None,  # После первой операции
                         3: None  # После второй операции
                     }
@@ -1195,11 +1255,6 @@ class CleaningWindow(QWidget):
 
         # Обновляем отображение
         self.viewer.display_current_page()
-
-        QTimer.singleShot(500, self.force_update_display)
-
-        # Обновляем все миниатюры
-        QTimer.singleShot(700, lambda: self.update_all_thumbs())
 
     def update_thumb_no_mask(self, page_idx):
         """Обновляет миниатюру без масок"""
@@ -2752,7 +2807,13 @@ class CleaningWindow(QWidget):
                 # Формирование имени
                 image_path = self.img_paths[page_idx]
                 base_name = os.path.basename(image_path)
-                output_filename = f"cleaned_{base_name}"
+
+                # Проверяем, есть ли уже префикс cleaned_
+                if base_name.startswith("cleaned_"):
+                    output_filename = base_name  # Сохраняем с тем же именем
+                else:
+                    output_filename = f"cleaned_{base_name}"
+
                 output_path = os.path.join(output_dir, output_filename)
 
                 # Сохранение
@@ -2795,10 +2856,10 @@ class CleaningWindow(QWidget):
                 # Удаление маски
                 self.comb_masks.pop(page_idx, None)
 
-                # Обновление статуса - ВАЖНО: устанавливаем 'saved' ПОСЛЕ обновления миниатюры
+                # Обновление статуса
                 self.img_status[page_idx] = 'saved'
 
-                # Теперь обновляем миниатюру
+                # Обновляем миниатюру
                 if 0 <= page_idx < len(self.thumb_labels):
                     try:
                         tw = THUMB_W
