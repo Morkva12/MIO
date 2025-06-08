@@ -1,16 +1,17 @@
 # ui/windows/m5_0_upload_images.py
-# Есть следующие баги
-# При выходе он не очищает лишнее
+
 # -*- coding: utf-8 -*-
 import os
 import shutil
 import json
 import datetime
 from pathlib import Path
+import gc
+import time
 
 from PySide6.QtCore import (
     Qt, QSize, QEvent, QRect, QMimeData, QIODevice, Signal, QAbstractItemModel,
-    QThread, QObject, Slot, QMetaObject, Q_ARG, QPoint
+    QThread, QObject, Slot, QMetaObject, Q_ARG, QPoint, QMutex, QMutexLocker
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QAction, QDrag
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 
 try:
     from PIL import Image
+
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -38,48 +40,51 @@ def loadImageConvertToPNG(source_path: str, target_path: str) -> bool:
     Пытается конвертировать (source_path) -> PNG (target_path).
     Возвращает True, если успех, иначе False.
     """
-    if PIL_AVAILABLE:
-        try:
-            with Image.open(source_path) as im:
-                if im.mode not in ("RGB", "RGBA"):
-                    im = im.convert("RGB")
-                im.save(target_path, "PNG")
-            print(f"[loadImageConvertToPNG] Конвертация {source_path} -> {target_path} (PIL).")
-            return True
-        except Exception as e:
-            print(f"[loadImageConvertToPNG] Ошибка PIL: {e}")
-            return False
+    try:
+        if PIL_AVAILABLE:
+            try:
+                with Image.open(source_path) as im:
+                    if im.mode not in ("RGB", "RGBA"):
+                        im = im.convert("RGB")
+                    im.save(target_path, "PNG")
+                print(f"[loadImageConvertToPNG] Конвертация {source_path} -> {target_path} (PIL).")
+                return True
+            except Exception as e:
+                print(f"[loadImageConvertToPNG] Ошибка PIL: {e}")
 
-    # Если нет PIL или произошла ошибка
-    img = QImage(source_path)
-    if not img.isNull():
-        if img.save(target_path, "PNG"):
-            print(f"[loadImageConvertToPNG] Конвертация {source_path} -> {target_path} (QImage).")
-            return True
+        # Если нет PIL или произошла ошибка
+        img = QImage(source_path)
+        if not img.isNull():
+            if img.save(target_path, "PNG"):
+                print(f"[loadImageConvertToPNG] Конвертация {source_path} -> {target_path} (QImage).")
+                return True
+            else:
+                print("[loadImageConvertToPNG] Ошибка сохранения QImage.")
+                return False
         else:
-            print("[loadImageConvertToPNG] Ошибка сохранения QImage.")
-            return False
-    else:
-        # Если и QImage не смог, тогда просто копируем
-        try:
-            shutil.copy2(source_path, target_path)
-            print(f"[loadImageConvertToPNG] Копирование {source_path} -> {target_path}.")
-            return True
-        except Exception as e:
-            print(f"[loadImageConvertToPNG] Ошибка копирования: {e}")
-            return False
+            # Если и QImage не смог, тогда просто копируем
+            try:
+                shutil.copy2(source_path, target_path)
+                print(f"[loadImageConvertToPNG] Копирование {source_path} -> {target_path}.")
+                return True
+            except Exception as e:
+                print(f"[loadImageConvertToPNG] Ошибка копирования: {e}")
+                return False
+    except Exception as e:
+        print(f"[loadImageConvertToPNG] Неожиданная ошибка: {e}")
+        return False
 
 
 def formatFileSize(size_bytes: int) -> str:
     """Человекочитаемое представление размера файла."""
     if size_bytes < 1024:
         return f"{size_bytes} Б"
-    elif size_bytes < 1024**2:
-        return f"{round(size_bytes/1024, 1)} КБ"
-    elif size_bytes < 1024**3:
-        return f"{round(size_bytes/(1024**2), 1)} МБ"
+    elif size_bytes < 1024 ** 2:
+        return f"{round(size_bytes / 1024, 1)} КБ"
+    elif size_bytes < 1024 ** 3:
+        return f"{round(size_bytes / (1024 ** 2), 1)} МБ"
     else:
-        return f"{round(size_bytes/(1024**3), 2)} ГБ"
+        return f"{round(size_bytes / (1024 ** 3), 2)} ГБ"
 
 
 ##############################################################################
@@ -88,51 +93,94 @@ def formatFileSize(size_bytes: int) -> str:
 class Worker(QObject):
     processed_file = Signal(dict)  # Сигнал при успешной обработке одного файла
     error = Signal(str)
+    finished = Signal()
 
     def __init__(self):
         super().__init__()
         self.upload_folder = ""
+        self.is_running = True
+        self.mutex = QMutex()
+
+    def stop(self):
+        """Безопасная остановка воркера"""
+        with QMutexLocker(self.mutex):
+            self.is_running = False
+
+    # В классе Worker измените метод add_file_slot:
 
     @Slot(str)
     def add_file_slot(self, file_path: str):
         """
         Слот для добавления файла. Вызывается в потоке воркера.
         """
-        if not os.path.exists(self.upload_folder):
-            err_msg = f"Папка загрузки не существует: {self.upload_folder}"
-            self.error.emit(err_msg)
-            print("[Worker]", err_msg)
-            return
-
-        original_name = os.path.basename(file_path)
-        now_str = datetime.datetime.now().isoformat()
-        timestamp = int(datetime.datetime.now().timestamp())
-        temp_name = f"temp_{timestamp}_{original_name}.png"
-        target_path = os.path.join(self.upload_folder, temp_name)
-
-        print(f"[Worker] Обработка файла: {file_path} => {target_path}")
-        ok = loadImageConvertToPNG(file_path, target_path)
-        if not ok:
-            err_msg = f"Не удалось обработать файл: {original_name}"
-            self.error.emit(err_msg)
-            print("[Worker]", err_msg)
-            return
+        with QMutexLocker(self.mutex):
+            if not self.is_running:
+                return
 
         try:
-            sz = os.path.getsize(target_path)
-            rec = {
-                "original_name": original_name,
-                "current_name": temp_name,
-                "size": sz,
-                "updated_at": now_str,
-                "added_at": now_str
-            }
-            # Уведомляем основной поток
-            self.processed_file.emit(rec)
+            if not os.path.exists(self.upload_folder):
+                err_msg = f"Папка загрузки не существует: {self.upload_folder}"
+                self.error.emit(err_msg)
+                print("[Worker]", err_msg)
+                return
+
+            original_name = os.path.basename(file_path)
+            now_str = datetime.datetime.now().isoformat()
+
+            # Используем микросекунды и случайное число для уникальности
+            import random
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            random_suffix = random.randint(1000, 9999)
+
+            # Добавляем хэш файла для различения одинаковых имен
+            import hashlib
+            with open(file_path, 'rb') as f:
+                file_hash = hashlib.md5(f.read(1024)).hexdigest()[:8]
+
+            temp_name = f"temp_{timestamp}_{random_suffix}_{file_hash}_{original_name}.png"
+            target_path = os.path.join(self.upload_folder, temp_name)
+
+            # Дополнительная проверка на существование файла
+            counter = 1
+            while os.path.exists(target_path):
+                temp_name = f"temp_{timestamp}_{random_suffix}_{file_hash}_{counter}_{original_name}.png"
+                target_path = os.path.join(self.upload_folder, temp_name)
+                counter += 1
+
+            print(f"[Worker] Обработка файла: {file_path} => {target_path}")
+
+            with QMutexLocker(self.mutex):
+                if not self.is_running:
+                    return
+
+            ok = loadImageConvertToPNG(file_path, target_path)
+            if not ok:
+                err_msg = f"Не удалось обработать файл: {original_name}"
+                self.error.emit(err_msg)
+                print("[Worker]", err_msg)
+                return
+
+            try:
+                sz = os.path.getsize(target_path)
+                rec = {
+                    "original_name": original_name,
+                    "current_name": temp_name,
+                    "size": sz,
+                    "updated_at": now_str,
+                    "added_at": now_str
+                }
+                # Уведомляем основной поток
+                with QMutexLocker(self.mutex):
+                    if self.is_running:
+                        self.processed_file.emit(rec)
+                        print(f"[Worker] Файл добавлен: {temp_name}")
+            except Exception as e:
+                err_msg = f"Ошибка при получении размера файла: {e}"
+                self.error.emit(err_msg)
+                print("[Worker]", err_msg)
         except Exception as e:
-            err_msg = f"Ошибка при получении размера файла: {e}"
-            self.error.emit(err_msg)
-            print("[Worker]", err_msg)
+            print(f"[Worker] Критическая ошибка: {e}")
+            self.error.emit(str(e))
 
 
 ##############################################################################
@@ -150,18 +198,21 @@ class ImageLoaderWorker(QObject):
         self.images_data = []
         self.upload_folder = ""
         self.target_size = QSize(140, 140)
+        self.mutex = QMutex()
 
     @Slot(list, str)
     def startLoading(self, images_data, upload_folder):
         """
         Слот, чтобы запустить загрузку миниатюр.
         """
-        if not self.running:
-            print("[ImageLoaderWorker] Операция прервана.")
-            return
+        with QMutexLocker(self.mutex):
+            if not self.running:
+                print("[ImageLoaderWorker] Операция прервана.")
+                return
 
-        self.images_data = images_data
-        self.upload_folder = upload_folder
+            self.images_data = images_data
+            self.upload_folder = upload_folder
+
         self.run()  # запускаем непосредственно
 
     def run(self):
@@ -172,32 +223,43 @@ class ImageLoaderWorker(QObject):
         print(f"[ImageLoaderWorker] Загружаем миниатюры, всего: {total} шт.")
 
         for idx, info in enumerate(self.images_data):
-            if not self.running:
-                break
+            with QMutexLocker(self.mutex):
+                if not self.running:
+                    break
 
-            current_name = info.get("current_name", "")
-            full_path = os.path.join(self.upload_folder, current_name)
-            if not os.path.isfile(full_path):
-                print(f"[ImageLoaderWorker] Файл не найден: {full_path}")
-                # Формируем серую заглушку
-                img = QImage(self.target_size, QImage.Format_RGB32)
-                img.fill(Qt.darkGray)
-                self.imageLoaded.emit(idx, img)
-                continue
+            try:
+                current_name = info.get("current_name", "")
+                full_path = os.path.join(self.upload_folder, current_name)
 
-            # Загружаем картинку
-            img = QImage(full_path)
-            if img.isNull():
-                print(f"[ImageLoaderWorker] Не удалось загрузить {full_path}, формируем заглушку.")
-                img = QImage(self.target_size, QImage.Format_RGB32)
-                img.fill(Qt.darkGray)
-            self.imageLoaded.emit(idx, img)
+                if not os.path.isfile(full_path):
+                    print(f"[ImageLoaderWorker] Файл не найден: {full_path}")
+                    # Формируем серую заглушку
+                    img = QImage(self.target_size, QImage.Format_RGB32)
+                    img.fill(Qt.darkGray)
+                else:
+                    # Загружаем картинку
+                    img = QImage(full_path)
+                    if img.isNull():
+                        print(f"[ImageLoaderWorker] Не удалось загрузить {full_path}, формируем заглушку.")
+                        img = QImage(self.target_size, QImage.Format_RGB32)
+                        img.fill(Qt.darkGray)
 
-        self.finished.emit()
+                with QMutexLocker(self.mutex):
+                    if self.running:
+                        self.imageLoaded.emit(idx, img)
+
+            except Exception as e:
+                print(f"[ImageLoaderWorker] Ошибка при загрузке изображения {idx}: {e}")
+
+        with QMutexLocker(self.mutex):
+            if self.running:
+                self.finished.emit()
         print("[ImageLoaderWorker] Загрузка миниатюр завершена.")
 
     def stop(self):
-        self.running = False
+        """Безопасная остановка загрузки"""
+        with QMutexLocker(self.mutex):
+            self.running = False
         print("[ImageLoaderWorker] Остановка загрузки миниатюр.")
 
 
@@ -493,6 +555,8 @@ class TileItem(QWidget):
 # Основное окно UploadWindow
 ##############################################################################
 class UploadWindow(QDialog):
+    images_updated = Signal(bool)  # Сигнал о том, что изображения были обновлены
+
     def __init__(self, chapter_path: str, stage_folder: str = "Загрузка", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Загрузка изображений")
@@ -513,6 +577,10 @@ class UploadWindow(QDialog):
         self.images_data = []
         self.modified = False
         self.loading_now = False
+        self.saving_now = False  # Флаг для блокировки во время сохранения
+
+        # Добавляем счетчик для уникальных ID
+        self.next_image_id = 1
 
         # Кэш
         self.pixmaps_cache = {}
@@ -584,9 +652,9 @@ class UploadWindow(QDialog):
         title_bar.addStretch(1)
 
         # Кнопка закрытия
-        btn_close = QPushButton("✕")
-        btn_close.setFixedSize(30, 30)
-        btn_close.setStyleSheet("""
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setFixedSize(30, 30)
+        self.btn_close.setStyleSheet("""
             QPushButton {
                 color: white;
                 background: transparent;
@@ -596,9 +664,12 @@ class UploadWindow(QDialog):
             QPushButton:hover {
                 color: #FF5C5C;
             }
+            QPushButton:disabled {
+                color: #666;
+            }
         """)
-        btn_close.clicked.connect(self.onCloseClicked)
-        title_bar.addWidget(btn_close)
+        self.btn_close.clicked.connect(self.onCloseClicked)
+        title_bar.addWidget(self.btn_close)
 
         main_layout.addLayout(title_bar)
 
@@ -624,6 +695,10 @@ class UploadWindow(QDialog):
             }
             QPushButton:hover {
                 background-color: #5E5E7F;
+            }
+            QPushButton:disabled {
+                background-color: #3E3E4F;
+                color: #666;
             }
         """)
         self.btn_select.clicked.connect(self.selectFiles)
@@ -696,6 +771,10 @@ class UploadWindow(QDialog):
             }
             QPushButton:hover {
                 background-color: #8E2EBF;
+            }
+            QPushButton:disabled {
+                background-color: #5E1E7F;
+                color: #AAA;
             }
         """)
         self.btn_save.clicked.connect(self.saveChanges)
@@ -798,13 +877,22 @@ class UploadWindow(QDialog):
         self.imageLoaderThread.started.connect(lambda: print("[UploadWindow] Поток ImageLoader запущен."))
         self.imageLoaderThread.start()
 
+    def showEvent(self, event):
+        """При показе окна перезагружаем данные"""
+        super().showEvent(event)
+        # Перезагружаем существующие данные
+        self.images_data = []
+        self.loadExistingData()
+        self.refreshUI()
+
     def onViewModeChanged(self, idx: int):
         """Переключаем стек на (0 = плитки, 1 = список)."""
         self.stacked_widget.setCurrentIndex(idx)
         self.updateDeleteButtonVisibility()
 
     def onWorkerError(self, message: str):
-        QMessageBox.critical(self, "Ошибка обработки файла", message)
+        if not self.saving_now:  # Не показываем ошибки во время сохранения
+            QMessageBox.critical(self, "Ошибка обработки файла", message)
 
     def loadExistingData(self):
         """
@@ -822,10 +910,22 @@ class UploadWindow(QDialog):
             print(f"[UploadWindow] Ошибка загрузки JSON: {e}")
             self.images_data = []
 
-        # Убедимся, что у всех есть added_at
+        # Убедимся, что у всех есть added_at и уникальный ID
+        max_id = 0
         for img in self.images_data:
             if "added_at" not in img:
                 img["added_at"] = img.get("updated_at", datetime.datetime.now().isoformat())
+
+            # Добавляем ID если его нет
+            if "id" not in img:
+                img["id"] = self.next_image_id
+                self.next_image_id += 1
+            else:
+                max_id = max(max_id, img["id"])
+
+        # Обновляем счетчик ID
+        if max_id > 0:
+            self.next_image_id = max_id + 1
 
         # Убираем фантомные записи, которых нет на диске
         existing_files = []
@@ -841,7 +941,12 @@ class UploadWindow(QDialog):
 
     def refreshUI(self):
         """Пересоздаём плитки и таблицу, запускаем загрузку миниатюр."""
+        # Очищаем кэш изображений перед обновлением
+        for pixmap in self.pixmaps_cache.values():
+            if pixmap and not pixmap.isNull():
+                del pixmap
         self.pixmaps_cache.clear()
+        gc.collect()
 
         # Плитки
         self.tileGrid.clearTiles()
@@ -850,7 +955,11 @@ class UploadWindow(QDialog):
         else:
             self.tileGrid.showNoImagesMessage(False)
             for i, info in enumerate(self.images_data):
-                tile = TileItem(i, info["original_name"], None)
+                # Используем ID вместе с именем для уникальности
+                display_name = info["original_name"]
+                tile = TileItem(i, display_name, None)
+                # Сохраняем ID в tile для идентификации
+                tile.image_id = info.get("id", -1)
                 self.tileGrid.addTile(tile)
             self.tileGrid.rebuildGrid()
 
@@ -887,21 +996,30 @@ class UploadWindow(QDialog):
     @Slot(int, object)
     def onImageLoaded(self, index, qimage):
         """Когда картинка загружена (QImage) в потоке."""
-        if index < 0 or index >= len(self.images_data):
-            return
-        px = QPixmap.fromImage(qimage)
-        self.pixmaps_cache[index] = px
+        try:
+            if index < 0 or index >= len(self.images_data):
+                return
 
-        # Обновляем плитку
-        if index < len(self.tileGrid.tile_items):
-            tile_item = self.tileGrid.tile_items[index]
-            tile_item.updatePixmap(px)
+            # Проверяем, что виджеты еще существуют
+            if not hasattr(self, 'tileGrid') or not hasattr(self, 'tableWidget'):
+                return
 
-        # Обновляем таблицу
-        lbl = self.tableWidget.cellWidget(index, 1)
-        if isinstance(lbl, QLabel):
-            scaled = px.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            lbl.setPixmap(scaled)
+            px = QPixmap.fromImage(qimage)
+            self.pixmaps_cache[index] = px
+
+            # Обновляем плитку
+            if hasattr(self.tileGrid, 'tile_items') and index < len(self.tileGrid.tile_items):
+                tile_item = self.tileGrid.tile_items[index]
+                tile_item.updatePixmap(px)
+
+            # Обновляем таблицу
+            if self.tableWidget.rowCount() > index:
+                lbl = self.tableWidget.cellWidget(index, 1)
+                if isinstance(lbl, QLabel):
+                    scaled = px.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    lbl.setPixmap(scaled)
+        except Exception as e:
+            print(f"[onImageLoaded] Ошибка: {e}")
 
     @Slot()
     def onImageLoaderFinished(self):
@@ -910,20 +1028,31 @@ class UploadWindow(QDialog):
 
     @Slot(str)
     def onImageLoaderError(self, message):
-        QMessageBox.warning(self, "Ошибка загрузки миниатюр", message)
+        if not self.saving_now:  # Не показываем ошибки во время сохранения
+            QMessageBox.warning(self, "Ошибка загрузки миниатюр", message)
 
     @Slot(dict)
     def _addNewFileThreadSafe(self, file_info: dict):
         """Добавление нового файла из воркера (в главном потоке)."""
-        self.images_data.append(file_info)
-        self.modified = True
-        self.refreshUI()
-        self.loading_now = False
+        try:
+            # Добавляем уникальный ID
+            file_info["id"] = self.next_image_id
+            self.next_image_id += 1
+
+            self.images_data.append(file_info)
+            self.modified = True
+            self.refreshUI()
+            self.loading_now = False
+            # Сигнализируем об обновлении
+            self.images_updated.emit(len(self.images_data) > 0)
+        except Exception as e:
+            print(f"[_addNewFileThreadSafe] Ошибка: {e}")
+            self.loading_now = False
 
     def onExternalFilesDropped(self, file_paths):
         """DnD внешних файлов на плитки."""
-        if self.loading_now:
-            print("[UploadWindow] Уже идёт загрузка, игнорируем.")
+        if self.loading_now or self.saving_now:
+            print("[UploadWindow] Операция в процессе, игнорируем.")
             return
         self.loading_now = True
         self.progress_bar.setVisible(True)
@@ -938,6 +1067,9 @@ class UploadWindow(QDialog):
 
     def selectFiles(self):
         """Кнопка 'Добавить...'"""
+        if self.saving_now:
+            return
+
         files, _ = QFileDialog.getOpenFileNames(
             self, "Выберите файлы",
             "", "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp);;Все файлы (*.*)"
@@ -995,10 +1127,11 @@ class UploadWindow(QDialog):
         """
         newData = []
         for tile_widget in self.tileGrid.tile_items:
-            name_label = tile_widget.label_name.text()
+            # Используем ID для идентификации
+            tile_id = getattr(tile_widget, 'image_id', -1)
             found = None
             for info in self.images_data:
-                if info["original_name"] == name_label:
+                if info.get("id", -1) == tile_id:
                     found = info
                     break
             if found:
@@ -1020,6 +1153,9 @@ class UploadWindow(QDialog):
         Удаляем выбранные плитки или строки. Физически удаляем файл,
         затем удаляем запись из self.images_data.
         """
+        if self.saving_now:
+            return
+
         idx = self.stacked_widget.currentIndex()
         removed_any = False
 
@@ -1035,6 +1171,7 @@ class UploadWindow(QDialog):
                     if os.path.exists(full_path):
                         try:
                             os.remove(full_path)
+                            print(f"[deleteSelected] Удален файл: {full_path}")
                         except Exception as e:
                             QMessageBox.warning(self, "Ошибка удаления", str(e))
                     del self.images_data[tile_idx]
@@ -1053,6 +1190,7 @@ class UploadWindow(QDialog):
                     if os.path.exists(full_path):
                         try:
                             os.remove(full_path)
+                            print(f"[deleteSelected] Удален файл: {full_path}")
                         except Exception as e:
                             QMessageBox.warning(self, "Ошибка удаления", str(e))
                     del self.images_data[ridx]
@@ -1061,80 +1199,237 @@ class UploadWindow(QDialog):
         if removed_any:
             self.modified = True
             self.refreshUI()
+            # Сигнализируем об обновлении
+            self.images_updated.emit(len(self.images_data) > 0)
+
+    def setUIEnabled(self, enabled):
+        """Включает/выключает весь интерфейс во время сохранения"""
+        self.btn_close.setEnabled(enabled)
+        self.btn_select.setEnabled(enabled)
+        self.btn_save.setEnabled(enabled)
+        self.btn_delete.setEnabled(enabled)
+        self.view_combo.setEnabled(enabled)
+        self.sort_combo.setEnabled(enabled)
+        self.tileGrid.setEnabled(enabled)
+        self.tableWidget.setEnabled(enabled)
+
+        # Изменяем курсор
+        if enabled:
+            self.setCursor(Qt.ArrowCursor)
+        else:
+            self.setCursor(Qt.WaitCursor)
 
     def saveChanges(self):
         """
-        1) Собираем порядок из плиток (актуальный).
-        2) Переименовываем файлы в 0001.png, 0002.png, ...
-           с учётом нового порядка.
-        3) Сохраняем JSON.
+        Сохраняет порядок изображений и переименовывает файлы с обработкой блокировок
         """
-        print("[UploadWindow] Сохраняем изменения.")
-
-        # Сначала берём актуальный порядок из плиток
-        ordered_data = []
-        for tile_widget in self.tileGrid.tile_items:
-            name_label = tile_widget.label_name.text()
-            found = None
-            for info in self.images_data:
-                if info["original_name"] == name_label:
-                    found = info
-                    break
-            if found:
-                ordered_data.append(found)
-
-        counter = 1
-        new_data = []
-        for info in ordered_data:
-            old_name = info["current_name"]
-            # Формируем имя с ведущими нулями: 4 знака (0001, 0002, ...)
-            new_name = f"{counter:04d}.png"
-            old_path = os.path.join(self.upload_folder, old_name)
-            new_path = os.path.join(self.upload_folder, new_name)
-
-            if old_name != new_name:  # Если имя уже совпадает, ничего не делаем
-                # Если новый файл уже существует, удаляем его
-                if os.path.exists(new_path):
-                    try:
-                        os.remove(new_path)
-                    except Exception as e:
-                        QMessageBox.warning(self, "Ошибка", f"Не удалось удалить {new_name}: {e}")
-                        continue
-
-                # Переименовываем
-                if os.path.exists(old_path):
-                    try:
-                        os.rename(old_path, new_path)
-                    except Exception as e:
-                        QMessageBox.warning(self, "Ошибка",
-                                            f"Не удалось переименовать {old_name} -> {new_name}: {e}")
-                        continue
-
-            # Обновляем данные
-            size_ = 0
-            if os.path.exists(new_path):
-                size_ = os.path.getsize(new_path)
-            info["current_name"] = new_name
-            info["size"] = size_
-            info["updated_at"] = datetime.datetime.now().isoformat()
-            new_data.append(info)
-            counter += 1
-
-        # Обновляем self.images_data по новому порядку
-        self.images_data = new_data
-
-        # Пишем JSON
-        try:
-            with open(self.images_json, "w", encoding="utf-8") as f:
-                json.dump(self.images_data, f, ensure_ascii=False, indent=4)
-            print(f"[UploadWindow] JSON сохранён: {self.images_json}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка сохранения", str(e))
+        if self.saving_now:
             return
 
-        self.modified = False
-        self.close()
-        print("[UploadWindow] Изменения успешно сохранены и окно закрыто.")
+        print("[UploadWindow] Сохраняем изменения.")
+        self.saving_now = True
+
+        # Блокируем интерфейс
+        self.setUIEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Индикатор неопределенного прогресса
+
+        try:
+            # СНАЧАЛА получаем актуальный порядок из плиток (до очистки!)
+            ordered_data = []
+            for tile_widget in self.tileGrid.tile_items:
+                # Используем ID для идентификации
+                tile_id = getattr(tile_widget, 'image_id', -1)
+                found = None
+                for info in self.images_data:
+                    if info.get("id", -1) == tile_id:
+                        found = info
+                        break
+                if found:
+                    ordered_data.append(found)
+
+            # Останавливаем потоки
+            self.worker.stop()
+            self.imageLoader.stop()
+
+            # Ждем завершения потоков
+            if self.imageLoaderThread.isRunning():
+                self.imageLoaderThread.quit()
+                if not self.imageLoaderThread.wait(2000):  # Ждем максимум 2 секунды
+                    print("[UploadWindow] Предупреждение: поток изображений не завершился вовремя")
+
+            # Очищаем кэш изображений и виджеты
+            self.clearImageCache()
+
+            # Принудительная сборка мусора
+            gc.collect()
+
+            counter = 1
+            new_data = []
+            rename_errors = []
+
+            # Используем микросекунды для уникальности временных имен
+            import random
+            base_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            random_base = random.randint(10000, 99999)
+
+            # Пытаемся переименовать все файлы с использованием временных имен
+            for idx, info in enumerate(ordered_data):
+                old_name = info["current_name"]
+                # Уникальное временное имя с индексом
+                temp_name = f"temp_{base_timestamp}_{random_base}_{idx}_{counter}.png"
+                final_name = f"{counter:04d}.png"
+                old_path = os.path.join(self.upload_folder, old_name)
+                temp_path = os.path.join(self.upload_folder, temp_name)
+                final_path = os.path.join(self.upload_folder, final_name)
+
+                # Сначала переименовываем в уникальное временное имя
+                if os.path.exists(old_path):
+                    success = self.safeRenameFile(old_path, temp_path)
+                    if success:
+                        # Сохраняем информацию для второго прохода
+                        info["temp_name"] = temp_name
+                        info["final_name"] = final_name
+                        new_data.append(info)
+                    else:
+                        rename_errors.append(f"Не удалось переименовать {old_name}")
+                else:
+                    print(f"[saveChanges] Файл не существует: {old_path}")
+                    rename_errors.append(f"Файл не существует: {old_name}")
+
+                counter += 1
+
+            # Второй проход: переименовываем из временных в финальные имена
+            for info in new_data:
+                temp_name = info.get("temp_name")
+                final_name = info.get("final_name")
+
+                if not temp_name or not final_name:
+                    continue
+
+                temp_path = os.path.join(self.upload_folder, temp_name)
+                final_path = os.path.join(self.upload_folder, final_name)
+
+                success = self.safeRenameFile(temp_path, final_path)
+                if success:
+                    # Обновляем информацию о файле
+                    info["current_name"] = final_name
+                    info["size"] = os.path.getsize(final_path)
+                    info["updated_at"] = datetime.datetime.now().isoformat()
+
+                    # Убираем временные поля
+                    if "temp_name" in info:
+                        del info["temp_name"]
+                    if "final_name" in info:
+                        del info["final_name"]
+                else:
+                    rename_errors.append(f"Не удалось переименовать {temp_name} в {final_name}")
+
+            # Обновляем список изображений
+            self.images_data = new_data
+
+            # Сохраняем JSON
+            try:
+                with open(self.images_json, "w", encoding="utf-8") as f:
+                    json.dump(self.images_data, f, ensure_ascii=False, indent=4)
+                print(f"[UploadWindow] JSON сохранён: {self.images_json}")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка сохранения JSON", str(e))
+                return
+
+            # Показываем ошибки, если были
+            if rename_errors:
+                error_msg = "\n".join(rename_errors[:5])
+                if len(rename_errors) > 5:
+                    error_msg += f"\n...и ещё {len(rename_errors) - 5} ошибок"
+                QMessageBox.warning(self, "Предупреждение", f"Некоторые файлы не удалось переименовать:\n{error_msg}")
+
+            self.modified = False
+            # Сигнализируем об успешном сохранении
+            self.images_updated.emit(len(self.images_data) > 0)
+            self.accept()  # Используем accept() вместо close()
+
+        except Exception as e:
+            print(f"[saveChanges] Критическая ошибка: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Произошла ошибка при сохранении: {str(e)}")
+        finally:
+            self.saving_now = False
+            self.setUIEnabled(True)
+            self.progress_bar.setVisible(False)
+            self.setCursor(Qt.ArrowCursor)
+
+    def clearImageCache(self):
+        """Очищает кэш изображений и освобождает память"""
+        # Очищаем изображения из таблицы
+        for i in range(self.tableWidget.rowCount()):
+            widget = self.tableWidget.cellWidget(i, 1)
+            if widget and isinstance(widget, QLabel):
+                widget.clear()
+                widget.setPixmap(QPixmap())  # Устанавливаем пустой pixmap
+
+        # Очищаем кэш
+        for pixmap in self.pixmaps_cache.values():
+            if pixmap and not pixmap.isNull():
+                del pixmap
+        self.pixmaps_cache.clear()
+
+    def reject(self):
+        """Переопределяем reject для выполнения очистки перед закрытием"""
+        if self.saving_now:
+            return  # Не позволяем закрыть во время сохранения
+
+        self.deleteObsoleteTempFiles()
+        self.stopThreads()
+        super().reject()
+
+    def stopThreads(self):
+        """Останавливает все потоки"""
+        # Останавливаем воркеры
+        if hasattr(self, 'worker'):
+            self.worker.stop()
+        if hasattr(self, 'imageLoader'):
+            self.imageLoader.stop()
+
+        # Останавливаем потоки
+        if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            self.worker_thread.wait(1000)
+
+        if hasattr(self, 'imageLoaderThread') and self.imageLoaderThread.isRunning():
+            self.imageLoaderThread.quit()
+            self.imageLoaderThread.wait(1000)
+
+    def safeRenameFile(self, src_path, dst_path, max_attempts=3, wait_time=0.1):
+        """
+        Безопасное переименование файла с повторными попытками
+        """
+        import time
+
+        for attempt in range(max_attempts):
+            try:
+                # Если целевой файл существует, удаляем его
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+
+                # Пытаемся переименовать
+                os.rename(src_path, dst_path)
+                return True
+
+            except PermissionError as e:
+                print(f"[safeRenameFile] Попытка {attempt + 1}/{max_attempts} не удалась: {e}")
+
+                # Принудительно очищаем кэши и собираем мусор
+                if hasattr(self, 'pixmaps_cache'):
+                    self.pixmaps_cache.clear()
+
+                gc.collect()
+                time.sleep(wait_time)
+
+            except Exception as e:
+                print(f"[safeRenameFile] Неожиданная ошибка: {e}")
+                return False
+
+        return False
 
     def updateDeleteButtonVisibility(self):
         idx = self.stacked_widget.currentIndex()
@@ -1146,10 +1441,17 @@ class UploadWindow(QDialog):
             self.btn_delete.setVisible(len(rows) > 0)
 
     def onCloseClicked(self):
+        if self.saving_now:
+            return  # Не позволяем закрыть во время сохранения
+
         self.deleteObsoleteTempFiles()
-        self.close()
+        self.reject()
 
     def closeEvent(self, event):
+        if self.saving_now:
+            event.ignore()  # Не позволяем закрыть во время сохранения
+            return
+
         if self.modified:
             resp = QMessageBox.question(
                 self, "Несохранённые изменения",
@@ -1158,27 +1460,16 @@ class UploadWindow(QDialog):
             )
             if resp == QMessageBox.Yes:
                 self.saveChanges()
-                self.deleteObsoleteTempFiles()
-                event.ignore()  # окно закроется внутри saveChanges()
-                return
+                event.ignore()  # saveChanges вызовет accept()
             elif resp == QMessageBox.No:
                 self.deleteTempFiles()
-                event.accept()
-            else:
-                self.deleteObsoleteTempFiles()
                 event.ignore()
-                return
+                self.reject()
+            else:
+                event.ignore()
         else:
-            event.accept()
-
-        # Останавливаем потоки
-        if self.worker_thread.isRunning():
-            self.worker_thread.quit()
-            self.worker_thread.wait()
-        if self.imageLoaderThread.isRunning():
-            self.imageLoader.stop()
-            self.imageLoaderThread.quit()
-            self.imageLoaderThread.wait()
+            event.ignore()
+            self.reject()
 
     def deleteTempFiles(self):
         """
@@ -1227,4 +1518,3 @@ if __name__ == "__main__":
     wnd = UploadWindow(chapter_path=test_chapter, stage_folder="Загрузка")
     wnd.show()
     sys.exit(app.exec())
-

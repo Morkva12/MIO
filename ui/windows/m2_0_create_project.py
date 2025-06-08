@@ -69,6 +69,7 @@ class GradientBackgroundWidget(QDialog):
 
 class ImagePreviewLabel(QLabel):
     """Виджет превью обложки с поддержкой Drag & Drop"""
+    clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -127,6 +128,7 @@ class ImagePreviewLabel(QLabel):
     def mousePressEvent(self, event):
         """Открытие диалога выбора файла по клику"""
         super().mousePressEvent(event)
+        self.clicked.emit()
         file_dialog = QFileDialog()
         file_dialog.setNameFilters(["Изображения (*.png *.jpg *.jpeg *.bmp *.gif)", "Все файлы (*)"])
         if file_dialog.exec():
@@ -207,6 +209,7 @@ class TagSuggestionList(QListWidget):
         self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
         self.setFocusPolicy(Qt.NoFocus)
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
 
         # Настройка внешнего вида
         self.setStyleSheet("""
@@ -446,11 +449,9 @@ class TagSuggestionList(QListWidget):
         selectable_items = [i for i in range(self.count()) if self.item(i).flags() & Qt.ItemIsSelectable]
 
         if not selectable_items:
+            self.hide()
             self.parent().setFocus()
             return
-
-        # Прерываем стандартное поведение Qt - это критически важно!
-        event.accept()
 
         if key in (Qt.Key_Enter, Qt.Key_Return):
             current_item = self.currentItem()
@@ -468,64 +469,30 @@ class TagSuggestionList(QListWidget):
             self.hide()
             self.parent().setFocus()
 
-        elif key == Qt.Key_N and event.modifiers() & Qt.ControlModifier:
-            if self.mode == "suggest" and self.current_input and self.current_input.strip():
-                # Проверка валидности тега
-                if (MIN_TAG_LENGTH <= len(self.current_input) <= MAX_TAG_LENGTH and
-                        '@' not in self.current_input):
-                    self.new_tag_created.emit(self.current_input)
-                    self.hide()
-                    self.parent().setFocus()
-                else:
-                    # Показываем предупреждение
-                    reason = ""
-                    if len(self.current_input) > MAX_TAG_LENGTH:
-                        reason = f"Тег слишком длинный (макс. {MAX_TAG_LENGTH} символов)"
-                    elif len(self.current_input) < MIN_TAG_LENGTH:
-                        reason = f"Тег слишком короткий (мин. {MIN_TAG_LENGTH} символ)"
-                    elif '@' in self.current_input:
-                        reason = "Тег содержит запрещённый символ @"
-
-                    QToolTip.showText(
-                        self.parent().mapToGlobal(self.parent().rect().bottomLeft()),
-                        f"Невозможно создать тег: {reason}",
-                        self.parent()
-                    )
-
         elif key == Qt.Key_Up:
             current_row = self.currentRow()
-
-            # Определяем индекс текущего элемента среди выбираемых
             try:
                 current_idx = selectable_items.index(current_row)
-                # Переходим к предыдущему или к последнему при циклическом переходе
                 next_idx = (current_idx - 1) % len(selectable_items)
             except ValueError:
-                # Если элемент не найден в списке выбираемых
                 next_idx = 0
-
-            # Устанавливаем новую выбранную строку
             self.setCurrentRow(selectable_items[next_idx])
 
         elif key == Qt.Key_Down:
             current_row = self.currentRow()
-
-            # Определяем индекс текущего элемента среди выбираемых
             try:
                 current_idx = selectable_items.index(current_row)
-                # Переходим к следующему или к первому при циклическом переходе
                 next_idx = (current_idx + 1) % len(selectable_items)
             except ValueError:
-                # Если элемент не найден в списке выбираемых
                 next_idx = 0
-
-            # Устанавливаем новую выбранную строку
             self.setCurrentRow(selectable_items[next_idx])
 
         else:
-            # Передаем все остальные клавиши обратно в поле ввода
+            # Передаем событие родителю
+            self.hide()
             self.parent().setFocus()
-            self.parent().event(event)
+            # Переотправляем событие в поле ввода
+            QApplication.sendEvent(self.parent(), event)
 
     def wheelEvent(self, event):
         """Блокировка прокрутки колесом мыши для малых списков"""
@@ -589,40 +556,7 @@ class TagSearchLineEdit(QLineEdit):
         # Кэш позиций тегов для подсветки
         self.invalid_tag_positions = []
 
-    def keyPressEvent(self, event):
-        """Обработка клавиш с улучшенным управлением фокусом"""
-        key = event.key()
 
-        # Если список открыт, обрабатываем стрелку вниз особым образом
-        if self.suggestion_list.isVisible() and key == Qt.Key_Down:
-            # Передаем фокус списку подсказок и выбираем первый элемент
-            self.suggestion_list.setFocus()
-
-            # Выбираем первый селектируемый элемент
-            selectable_items = [i for i in range(self.suggestion_list.count())
-                                if self.suggestion_list.item(i).flags() & Qt.ItemIsSelectable]
-            if selectable_items:
-                self.suggestion_list.setCurrentRow(selectable_items[0])
-            event.accept()
-            return
-
-        # Обработка запятой
-        if key == Qt.Key_Comma:
-            self.insert_comma()
-            event.accept()
-            return
-
-        # Открытие списка редактирования тега по двойному клику на Tab
-        if key == Qt.Key_Tab and event.modifiers() & Qt.ControlModifier:
-            self.open_tag_editor()
-            event.accept()
-            return
-
-        # Стандартная обработка для других клавиш
-        super().keyPressEvent(event)
-
-        # Отложенное обновление подсказок для снижения нагрузки
-        self.suggestion_timer.start(100)
 
     def mousePressEvent(self, event):
         """Обработка клика по полю ввода"""
@@ -838,9 +772,12 @@ class TagSearchLineEdit(QLineEdit):
         self.suggestion_list.updateGeometry()
         self.suggestion_list.show()
 
-        # Возвращаем фокус на поле ввода
-        self.setFocus()
-        self.setCursorPosition(current_cursor_pos)
+        # ВАЖНО: Устанавливаем атрибут, чтобы список не забирал фокус навсегда
+        self.suggestion_list.setAttribute(Qt.WA_ShowWithoutActivating)
+
+        # Возвращаем фокус на поле ввода сразу после показа
+        QTimer.singleShot(0, lambda: self.setFocus())
+        QTimer.singleShot(0, lambda: self.setCursorPosition(current_cursor_pos))
 
     def insert_tag(self, tag):
         """Вставка выбранного тега с валидацией"""

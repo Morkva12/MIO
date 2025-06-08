@@ -1373,6 +1373,12 @@ class MainWindow(QMainWindow):
 
     def closeProject(self):
         """Закрывает проект и возвращает к основному виду"""
+        # Сохраняем актуальное имя папки проекта перед закрытием
+        if hasattr(self, 'project_window') and hasattr(self.project_window, 'metadata'):
+            current_folder = self.project_window.metadata.get('folder_name')
+            if current_folder:
+                self._current_project_folder = current_folder
+
         # Удаляем окно проекта и его контейнер
         if hasattr(self, 'project_window'):
             self.project_window.deleteLater()
@@ -1415,28 +1421,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_saved_scale_factor'):
             self.scale_factor = self._saved_scale_factor
 
-        # Проверяем, нужно ли обновить проект в списке (если данные изменились)
-        if hasattr(self, '_current_project_folder'):
-            folder_name = self._current_project_folder
-            project_path = os.path.join(self.paths['projects'], folder_name)
-
-            # Обновляем данные проекта, если они изменились
-            metadata_path = os.path.join(project_path, "metadata.json")
-            if os.path.isfile(metadata_path):
-                try:
-                    with open(metadata_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-
-                    # Ищем проект в списке
-                    for i, (pixmap, title, name, date, tags) in enumerate(self.all_tiles_data):
-                        if name == folder_name:
-                            # Обновляем данные
-                            new_title = data.get("name", folder_name)
-                            new_tags = data.get("tags", [])
-                            self.all_tiles_data[i] = (pixmap, new_title, folder_name, date, new_tags)
-                            break
-                except Exception as e:
-                    print(f"[main_window] ERROR: ❌ Ошибка обновления проекта {folder_name}: {e}")
+        # Перезагружаем все проекты, чтобы обновить список
+        self.loadProjects()
 
         # Обновляем заголовок
         self.setWindowTitle("MangaLocalizer")
@@ -1573,7 +1559,69 @@ class MainWindow(QMainWindow):
 
     def editProject(self, folder_name):
         """Редактирование проекта"""
-        pass  # Будет реализовано для редактирования в главном окне
+        # Создаём эффект размытия
+        self.blur_effect = QGraphicsBlurEffect()
+        self.blur_effect.setBlurRadius(15)
+        self.gradient_widget.setGraphicsEffect(self.blur_effect)
+
+        self.gradient_widget.update()
+        QApplication.processEvents()
+
+        # Создаём оверлей
+        self.overlay = QWidget(self)
+        self.overlay.setGeometry(self.rect())
+        self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 30);")
+        self.overlay.setCursor(Qt.ForbiddenCursor)
+        self.overlay.setObjectName("modal_overlay")
+        self.overlay.show()
+
+        # Создаём дочернее окно редактирования
+        from ui.windows.m3_0_edit_project import open_edit_project_window
+        project_path = os.path.join(self.paths['projects'], folder_name)
+        self.edit_project_window = open_edit_project_window(project_path, self, self.paths['projects'])
+        self.edit_project_window.setParent(self)
+        self.edit_project_window.setWindowFlags(Qt.Widget | Qt.FramelessWindowHint)
+
+        # Центрирование окна
+        self._centerEditWindow()
+        self.edit_project_window.show()
+        self.edit_project_window.finished.connect(self._onEditDialogFinished)
+        self.edit_project_window.project_updated.connect(self._onProjectUpdated)
+
+    def _centerEditWindow(self):
+        """Центрирование окна редактирования"""
+        if not hasattr(self, 'edit_project_window') or not self.edit_project_window:
+            return
+
+        parent_width = self.width()
+        parent_height = self.height()
+        dialog_width = self.edit_project_window.width()
+        dialog_height = self.edit_project_window.height()
+
+        x = (parent_width - dialog_width) // 2
+        y = (parent_height - dialog_height) // 2
+
+        self.edit_project_window.move(x, y)
+        self.edit_project_window.raise_()
+
+    def _onEditDialogFinished(self, result):
+        """Обработчик закрытия диалога редактирования"""
+        # Удаляем оверлей
+        if self.overlay:
+            self.overlay.deleteLater()
+            self.overlay = None
+
+        # Удаляем эффект размытия
+        self.gradient_widget.setGraphicsEffect(None)
+
+        # Очищаем ссылку на окно
+        self.edit_project_window = None
+
+    def _onProjectUpdated(self, metadata):
+        """Обработчик обновления проекта"""
+        # Перезагружаем список проектов
+        self.loadProjects()
+        self.applySortAndFilter()
 
     # ==================== УПРАВЛЕНИЕ ДИАЛОГОМ СОЗДАНИЯ ПРОЕКТА ====================
 

@@ -1,52 +1,40 @@
 # -*- coding: utf-8 -*-
-# ui/windows/m8_0_cleaning_window.py
-import os
-import json
-import numpy as np
-import cv2
-import logging
+import os, json, numpy as np, cv2, logging, time
 from PIL import Image
 from threading import Thread
-from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QPointF, QRectF, QThread
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QPointF, QRectF, QThread, QBuffer
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QScrollArea, QSplitter, QGroupBox, QRadioButton, QButtonGroup,
                                QMessageBox, QCheckBox, QSlider, QProgressBar, QApplication,
-                               QComboBox, QGridLayout, QGraphicsPixmapItem, QGraphicsScene)
-from PySide6.QtGui import QPixmap, QColor, QPainter, QImage, QPolygonF, QBrush, QPen
+                               QComboBox, QGridLayout,QGraphicsScene)
+from PySide6.QtGui import QPixmap, QColor, QPainter, QImage
 
 from ui.windows.m8_1_graphics_items import SelectionEvent, EditableMask, EditablePolygonMask, BrushStroke
 from ui.windows.m8_2_image_viewer import CustomImageViewer, DrawingMode, PageChangeSignal
 from ui.windows.m8_3_utils import DetectionManager, enable_cuda_cudnn
-import time
+import io
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
 # Константы
-THUMB_W = 150
-THUMB_H = 300
-MIN_BRUSH = 1
-MAX_BRUSH = 50
-DEF_BRUSH = 5
+THUMB_W, THUMB_H = 150, 300
+MIN_BRUSH, MAX_BRUSH, DEF_BRUSH = 1, 50, 5
 PROG_HIDE_MS = 5000
 MASK_EXP_DEF = 10
-import io
-from PySide6.QtCore import QBuffer
-
 
 class ImgCleanWorker(QThread):
     """Воркер для очистки изображения"""
     prog = Signal(int, int, str)
     err = Signal(str)
-    done_img = Signal(int, str, QPixmap)
+    done_img = Signal(int, QPixmap)  # page_idx, result_pixmap
 
-    def __init__(self, lama, pixmap, mask, page_idx, out_dir, out_path=None):
+    def __init__(self, lama, pixmap, mask, page_idx):
         super().__init__()
         self.lama = lama
         self.pixmap = pixmap
-        self.out_path = out_path
         self.mask = mask
         self.page_idx = page_idx
-        self.out_dir = out_dir
 
     def run(self):
         try:
@@ -59,14 +47,6 @@ class ImgCleanWorker(QThread):
                 return
 
             logger.info(f"Запуск очистки для страницы {self.page_idx + 1}, маска содержит {mask_px} пикселей")
-
-            # Отладочная маска
-            try:
-                dbg_mask_path = os.path.join(self.out_dir, f"worker_mask_{self.page_idx}.png")
-                if os.access(os.path.dirname(dbg_mask_path), os.W_OK):
-                    cv2.imwrite(dbg_mask_path, self.mask)
-            except Exception as e:
-                logger.warning(f"Не удалось сохранить отладочную маску: {str(e)}")
 
             # Конвертация QPixmap в PIL
             try:
@@ -97,40 +77,13 @@ class ImgCleanWorker(QThread):
                 fixed_mask[:h, :w] = mask_arr[:h, :w]
                 mask_arr = fixed_mask
 
-                try:
-                    cv2.imwrite(os.path.join(self.out_dir, f"corrected_mask_{self.page_idx}.png"), mask_arr)
-                except Exception as e:
-                    logger.warning(f"Не удалось сохранить исправленную маску: {str(e)}")
-
             # Конвертация в PIL
             mask_pil = Image.fromarray(mask_arr).convert('L')
-
-            # Отладочное сохранение
-            try:
-                img.save(os.path.join(self.out_dir, f"input_img_{self.page_idx}.png"))
-                mask_pil.save(os.path.join(self.out_dir, f"input_mask_{self.page_idx}.png"))
-            except Exception as e:
-                logger.warning(f"Не удалось сохранить входные данные: {str(e)}")
 
             self.prog.emit(0, 1, f"Запуск LaMa инпейнтинга для страницы {self.page_idx + 1}...")
 
             # Очистка с LaMa
             result = self.lama(img, mask_pil)
-
-            # Путь для сохранения
-            if self.out_path:
-                out_path = self.out_path
-            else:
-                # Имя файла по умолчанию
-                ts = int(time.time())
-                out_path = os.path.join(self.out_dir, f"cleaned_image_{self.page_idx}_{ts}.png")
-
-            try:
-                result.save(out_path)
-                logger.info(f"Результат сохранен в: {out_path}")
-            except Exception as e:
-                self.err.emit(f"Ошибка сохранения результата: {str(e)}")
-                return
 
             # QPixmap из результата
             try:
@@ -146,17 +99,10 @@ class ImgCleanWorker(QThread):
                     raise ValueError("Не удалось создать QPixmap из результата")
             except Exception as e:
                 self.err.emit(f"Ошибка создания превью: {str(e)}")
-                # Запасной вариант
-                try:
-                    res_pixmap = QPixmap(out_path)
-                    if res_pixmap.isNull():
-                        raise ValueError("Не удалось загрузить QPixmap из файла")
-                except Exception as e2:
-                    self.err.emit(f"Не удалось создать превью из файла: {str(e2)}")
-                    return
+                return
 
             self.prog.emit(1, 1, "Очистка успешно завершена")
-            self.done_img.emit(self.page_idx, out_path, res_pixmap)
+            self.done_img.emit(self.page_idx, res_pixmap)
 
         except Exception as e:
             logger.error(f"Ошибка очистки изображения {self.page_idx}: {str(e)}")
@@ -185,17 +131,15 @@ class CleaningWindow(QWidget):
         self.chapter_folder = chapter_folder
 
         # Состояние
-        self.processing = False
+        self.proc = False
         self.curr_op = None
         self.clean_workers = []
-        self.detection_cancelled = False
-        self.segmentation_cancelled = False
+        self.det_canc = False
+        self.segm_canc = False
 
         # Буфер для истории (1->2->3->циклично)
-        self.circ_buf = {}  # page_idx -> {0: бэкап, 1: оригинал, 2: первая операция, 3: вторая операция}
-
-        # Статус изображений
-        self.img_status = {}  # page_idx -> 'saved', 'modified', 'unsaved'
+        self.circ_buf = {}
+        self.img_status = {}
 
         # Проверка AI
         try:
@@ -219,7 +163,7 @@ class CleaningWindow(QWidget):
             "cleaning_folder": os.path.join(chapter_folder, "Клининг"),
             "enhanced_folder": os.path.join(chapter_folder, "Предобработка"),
             "originals_folder": os.path.join(chapter_folder, "Загрузка", "originals"),
-            "upload_folder": os.path.join(chapter_folder, "Загрузка", "e")
+            "upload_folder": os.path.join(chapter_folder, "Загрузка")
         }
 
         os.makedirs(self.chapter_paths["cleaning_folder"], exist_ok=True)
@@ -233,7 +177,7 @@ class CleaningWindow(QWidget):
 
         self.comb_masks = {}
 
-        # Классы детекции
+        # Классы детекции и сегментации
         self.detect_cls = {
             'Text': {'threshold': 0.5, 'enabled': True, 'color': (255, 0, 0)},
             'Sound': {'threshold': 0.5, 'enabled': False, 'color': (0, 255, 0)},
@@ -241,7 +185,6 @@ class CleaningWindow(QWidget):
             'ComplexText': {'threshold': 0.5, 'enabled': False, 'color': (255, 128, 0)},
         }
 
-        # Классы сегментации
         self.segm_cls = {
             'TextSegm': {'threshold': 0.5, 'enabled': True, 'color': (255, 255, 0)},
             'Sound': {'threshold': 0.5, 'enabled': False, 'color': (255, 0, 255)},
@@ -258,39 +201,33 @@ class CleaningWindow(QWidget):
         self.saved_detect_exp = MASK_EXP_DEF
         self.saved_segm_exp = MASK_EXP_DEF
 
+        # Определение источника
+        self.img_paths = self._decide_img_source()
+
+        if not self.img_paths:
+            # Если пользователь отменил выбор, планируем закрытие
+            QTimer.singleShot(100, self._handleCancelledInit)
+            return
+
         # UI
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
-        # Определение источника
-        self.img_paths = self._decide_img_source()
-
-        if not self.img_paths:
-            QMessageBox.critical(self, "Ошибка", "Не найдены изображения.")
-            self.back_req.emit()
-            return
-
         # UI компоненты
         self._init_top_bar()
 
-        # Менеджер детекции
-
-
         self.page_change_sig = PageChangeSignal()
-        self.page_change_sig.page_changed.connect(self.update_active_thumb)
+        self.page_change_sig.page_changed.connect(self.upd_active_thumb)
 
         # Просмотрщик
         self.viewer = CustomImageViewer(self.img_paths, parent=self)
-
-        # Атрибут загрузки
         self.viewer.page_loading_status = {i: False for i in range(len(self.img_paths))}
 
         # Панель превью
         self.preview_scroll = self._create_preview_panel()
-
         self._init_content()
-        self.update_active_thumb(self.viewer.cur_page)
+        self.upd_active_thumb(self.viewer.cur_page)
 
         self.prog_timers = {}
 
@@ -307,8 +244,10 @@ class CleaningWindow(QWidget):
         self.shortcut_timer.start(100)
 
         # Сигналы
-        self.viewer.mask_updated.connect(self.update_thumb_no_mask)
+        self.viewer.mask_updated.connect(self.upd_thumb_no_mask)
         self.detect_mgr = DetectionManager(self.ai_models, self.detect_cls, self.segm_cls)
+        self.detect_mgr.set_viewer(self.viewer)
+        self.sync_detection_manager()
         for cls_name, info in self.detect_cls.items():
             if cls_name == 'Text':
                 self.cb_text.setChecked(info['enabled'])
@@ -318,6 +257,7 @@ class CleaningWindow(QWidget):
                 self.cb_sound.setChecked(info['enabled'])
             elif cls_name == 'FonText':
                 self.cb_fontext.setChecked(info['enabled'])
+
         # Рисование в реальном времени
         if hasattr(self.viewer, 'scene_'):
             self.viewer.scene_.update = self.on_scene_update
@@ -325,37 +265,29 @@ class CleaningWindow(QWidget):
         # Загрузка изображений
         QTimer.singleShot(500, self.force_load_imgs)
 
-    def sync_detection_classes(self):
-        """Синхронизирует словари классов между окном и менеджером детекции"""
+    def _handleCancelledInit(self):
+        """Обработчик отмены инициализации"""
+        self.back_requested.emit()
+    def sync_det_classes(self):
+        """Синхронизирует словари классов"""
         if hasattr(self, 'detect_mgr'):
-            # Синхронизируем на основе чекбоксов, а не словарей
-            sound_enabled = self.cb_sound.isChecked()
-            complex_enabled = self.cb_complex_text.isChecked()
-            fontext_enabled = self.cb_fontext.isChecked()
-            text_enabled = self.cb_text.isChecked()
+            sound_en = self.cb_sound.isChecked()
+            complex_en = self.cb_complex_text.isChecked()
+            fontext_en = self.cb_fontext.isChecked()
+            text_en = self.cb_text.isChecked()
 
             # Обновляем локальный словарь
-            self.detect_cls['Sound']['enabled'] = sound_enabled
-            self.detect_cls['ComplexText']['enabled'] = complex_enabled
-            self.detect_cls['FonText']['enabled'] = fontext_enabled
-            self.detect_cls['Text']['enabled'] = text_enabled
+            self.detect_cls['Sound']['enabled'] = sound_en
+            self.detect_cls['ComplexText']['enabled'] = complex_en
+            self.detect_cls['FonText']['enabled'] = fontext_en
+            self.detect_cls['Text']['enabled'] = text_en
 
             # Обновляем словарь в менеджере детекции
-            self.detect_mgr.detect_classes['Sound']['enabled'] = sound_enabled
-            self.detect_mgr.detect_classes['ComplexText']['enabled'] = complex_enabled
-            self.detect_mgr.detect_classes['FonText']['enabled'] = fontext_enabled
-            self.detect_mgr.detect_classes['Text']['enabled'] = text_enabled
+            self.detect_mgr.detect_classes['Sound']['enabled'] = sound_en
+            self.detect_mgr.detect_classes['ComplexText']['enabled'] = complex_en
+            self.detect_mgr.detect_classes['FonText']['enabled'] = fontext_en
+            self.detect_mgr.detect_classes['Text']['enabled'] = text_en
 
-            logger.info(f"Синхронизировано: Text={text_enabled}")
-            logger.info(f"Синхронизировано: Sound={sound_enabled}")
-            logger.info(f"Синхронизировано: FonText={fontext_enabled}")
-            logger.info(f"Синхронизировано: ComplexText={complex_enabled}")
-
-            # Выводим для отладки
-            logger.info("=== Состояние после синхронизации ===")
-            logger.info("Словарь DetectionManager.detect_classes:")
-            for cls, info in self.detect_mgr.detect_classes.items():
-                logger.info(f"- {cls}: enabled={info['enabled']}")
     @property
     def detect_progress(self):
         """Свойство для совместимости с m8_3_utils.py"""
@@ -374,7 +306,6 @@ class CleaningWindow(QWidget):
         """Метод для совместимости с m8_3_utils.py"""
         return self.unlock_ui()
 
-
     def on_scene_update(self):
         """Обработчик обновления сцены"""
         # Оригинальный метод
@@ -387,7 +318,7 @@ class CleaningWindow(QWidget):
                 self.thumb_update_timer = QTimer()
                 self.thumb_update_timer.setSingleShot(True)
                 self.thumb_update_timer.timeout.connect(
-                    lambda: self.update_thumb_no_mask(self.viewer.cur_page))
+                    lambda: self.upd_thumb_no_mask(self.viewer.cur_page))
 
             # Запускаем таймер если не активен
             if not self.thumb_update_timer.isActive():
@@ -396,10 +327,10 @@ class CleaningWindow(QWidget):
             # Устанавливаем статус
             if self.viewer.cur_page in self.img_status:
                 self.img_status[self.viewer.cur_page] = 'modified'
-                self.update_thumb_status(self.viewer.cur_page)
+                self.upd_thumb_status(self.viewer.cur_page)
 
-    def save_to_circ_buf(self, page_idx):
-        """Сохраняет текущее состояние изображения в буфер по схеме 1->2->3->2->3"""
+    def save_to_buf(self, page_idx):
+        """Сохраняет текущее состояние изображения в буфер"""
         if page_idx not in self.circ_buf:
             self.circ_buf[page_idx] = {
                 0: None,  # Бэкап из другого этапа
@@ -418,27 +349,18 @@ class CleaningWindow(QWidget):
 
             # Обновляем статус
             self.img_status[page_idx] = 'modified'
-            self.update_thumb_status(page_idx)
-
-            logger.info(f"Сохранено состояние изображения {page_idx + 1} в циркулярный буфер")
+            self.upd_thumb_status(page_idx)
 
     def is_valid_mask(self, mask):
         """Проверяет валидность маски для инпейнтинга"""
         if mask is None:
             return False
-
-        # Проверка типа
         if not isinstance(mask, np.ndarray):
             return False
-
-        # Проверка размера
         if mask.size == 0 or mask.ndim != 2:
             return False
-
-        # Проверка ненулевых пикселей
         if np.sum(mask > 0) == 0:
             return False
-
         return True
 
     def _setup_model_paths(self):
@@ -482,120 +404,291 @@ class CleaningWindow(QWidget):
                 if os.path.exists(segm_path):
                     self.ai_models["segm"] = segm_path
 
-        logger.info(f"Пути к моделям - Детекция: {self.ai_models['detect']}, Сегментация: {self.ai_models['segm']}")
-
-    def _update_progress_bar_immediate(self, prog_bar, val, total, msg=""):
-        """Немедленно обновляет прогресс-бар в главном потоке
-
-        Параметры:
-        prog_bar -- объект QProgressBar для обновления
-        val -- текущее значение прогресса
-        total -- максимальное значение (100%)
-        msg -- текстовое сообщение для отображения в прогресс-баре
-        """
-        # Устанавливаем диапазон прогресс-бара
+    def _upd_prog_bar(self, prog_bar, val, total, msg=""):
+        """Обновляет прогресс-бар"""
         prog_bar.setRange(0, total)
-
-        # Устанавливаем текущее значение
         prog_bar.setValue(val)
-
-        # Если есть сообщение, обновляем формат отображения
         if msg:
             prog_bar.setFormat(msg)
-
-        # Делаем прогресс-бар видимым
         prog_bar.setVisible(True)
-
-        # Критически важно: принудительно обрабатываем события приложения
-        # чтобы UI обновился немедленно, не дожидаясь завершения текущей операции
         QApplication.processEvents()
 
     def _decide_img_source(self):
-        """Определение источника изображений"""
-        # 1. Сначала проверяем saved_images.json
-        saved_config_path = os.path.join(self.chapter_paths.get("cleaning_folder", ""), "saved_images.json")
-        if os.path.exists(saved_config_path):
+        """Определение источника изображений с диалогом выбора"""
+        cleaning_folder = self.chapter_paths["cleaning_folder"]
+
+        # Проверяем наличие сохраненной конфигурации
+        config_path = os.path.join(cleaning_folder, "image_source_config.json")
+
+        # Если в папке клининг уже есть изображения - используем их
+        existing_cleaning_images = self._get_imgs_from_folder(cleaning_folder)
+        if existing_cleaning_images:
+            logger.info(f"Найдено {len(existing_cleaning_images)} изображений в папке Клининг")
+            return existing_cleaning_images
+
+        # Проверяем доступные источники
+        sources = {}
+
+        # Предобработка/Save
+        save_folder = os.path.join(self.chapter_paths["enhanced_folder"], "Save")
+        if os.path.exists(save_folder):
+            save_images = self._get_imgs_from_folder(save_folder)
+            if save_images:
+                sources["preprocess_save"] = {
+                    "path": save_folder,
+                    "images": save_images,
+                    "name": "Предобработка (Save)",
+                    "count": len(save_images)
+                }
+
+        # Загрузка
+        upload_images = self._get_imgs_from_folder(self.chapter_paths["upload_folder"])
+        if upload_images:
+            sources["upload"] = {
+                "path": self.chapter_paths["upload_folder"],
+                "images": upload_images,
+                "name": "Загрузка",
+                "count": len(upload_images)
+            }
+
+        if not sources:
+            QMessageBox.critical(self, "Ошибка", "Не найдены изображения для обработки")
+            return []
+
+        # Если есть сохраненная конфигурация
+        if os.path.exists(config_path):
             try:
-                with open(saved_config_path, 'r', encoding='utf-8') as f:
-                    saved_data = json.load(f)
-                    saved_paths = saved_data.get("paths", [])
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    saved_source = config.get("source")
+                    if saved_source in sources:
+                        # Копируем изображения в папку клининг
+                        self._copy_images_to_cleaning(sources[saved_source]["images"])
+                        return self._get_imgs_from_folder(cleaning_folder)
+            except:
+                pass
 
-                    # Проверяем, что все пути существуют
-                    all_exist = all(os.path.exists(path) for path in saved_paths)
-                    if all_exist and saved_paths:
-                        logger.info(f"Загружаем сохраненные изображения из {saved_config_path}")
-                        return saved_paths
-            except Exception as e:
-                logger.error(f"Ошибка при загрузке сохраненных путей: {str(e)}")
+        # Показываем диалог выбора источника
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QRadioButton, QPushButton, QButtonGroup
 
-        # 2. Если JSON не найден, проверяем папку Клининг напрямую
-        cleaning_folder = self.chapter_paths.get("cleaning_folder", "")
-        if cleaning_folder and os.path.isdir(cleaning_folder):
-            cleaned_images = []
-            for file in os.listdir(cleaning_folder):
-                if file.lower().startswith("cleaned_") and file.lower().endswith(
-                        ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
-                    cleaned_images.append(os.path.join(cleaning_folder, file))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Выбор источника изображений")
+        dialog.setModal(True)
+        dialog.setFixedWidth(400)
 
-            if cleaned_images:
-                # Сортируем изображения по имени
-                cleaned_images.sort()
-                logger.info(f"Найдено {len(cleaned_images)} очищенных изображений в папке Клининг")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-                # Сохраняем пути в JSON для последующей загрузки
-                try:
-                    with open(saved_config_path, 'w', encoding='utf-8') as f:
-                        json.dump({"paths": cleaned_images}, f, ensure_ascii=False, indent=4)
-                    logger.info(f"Пути сохранены в {saved_config_path}")
-                except Exception as e:
-                    logger.error(f"Ошибка при сохранении путей: {str(e)}")
+        label = QLabel("Выберите источник изображений для клининга:")
+        label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(label)
 
-                return cleaned_images
+        button_group = QButtonGroup()
+        selected_source = None
 
-        # 3. Если очищенных изображений нет, ищем в папках Enhanced/Originals
-        e_folder = os.path.join(self.chapter_paths.get("enhanced_folder", ""), "Enhanced")
-        o_folder = os.path.join(self.chapter_paths.get("enhanced_folder", ""), "Originals")
-        u_folder = self.chapter_paths.get("upload_folder", "")
+        for key, source_info in sources.items():
+            radio = QRadioButton(f"{source_info['name']} ({source_info['count']} изображений)")
+            radio.setStyleSheet("margin: 10px 0;")
+            button_group.addButton(radio)
+            radio.toggled.connect(lambda checked, k=key: setattr(dialog, 'selected_source', k if checked else None))
+            layout.addWidget(radio)
 
-        result_imgs = {}
-        base_names = set()
+            # Выбираем первый по умолчанию
+            if selected_source is None:
+                radio.setChecked(True)
+                dialog.selected_source = key
 
-        # Поиск в улучшенных
-        if e_folder and os.path.isdir(e_folder):
-            for file in os.listdir(e_folder):
-                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
-                    base_name = file.split('_enhanced')[0]
-                    base_names.add(base_name)
-                    result_imgs[base_name] = os.path.join(e_folder, file)
+        # Кнопки
+        button_layout = QHBoxLayout()
 
-        # Поиск в оригинальных
-        if o_folder and os.path.isdir(o_folder):
-            for file in os.listdir(o_folder):
-                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
-                    base_name = os.path.splitext(file)[0]
-                    if base_name not in base_names:
-                        base_names.add(base_name)
-                        result_imgs[base_name] = os.path.join(o_folder, file)
+        ok_btn = QPushButton("OK")
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7E1E9F;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #9E3EAF;
+            }
+        """)
+        ok_btn.clicked.connect(dialog.accept)
 
-        # Если ничего не найдено, ищем в загрузке
-        if not result_imgs and u_folder and os.path.isdir(u_folder):
-            return self._get_imgs_from_folder(u_folder)
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #777;
+            }
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
 
-        # Сортировка
-        sorted_imgs = [result_imgs[name] for name in sorted(result_imgs.keys())]
-        return sorted_imgs
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(ok_btn)
+
+        layout.addLayout(button_layout)
+
+        if dialog.exec() == QDialog.Accepted and hasattr(dialog, 'selected_source'):
+            selected = dialog.selected_source
+
+            # Сохраняем выбор
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump({"source": selected}, f, ensure_ascii=False, indent=4)
+
+            # Копируем изображения в папку клининг
+            self._copy_images_to_cleaning(sources[selected]["images"])
+
+            return self._get_imgs_from_folder(cleaning_folder)
+
+        return []
 
     def _get_imgs_from_folder(self, folder):
         """Получение списка изображений из папки"""
         if not os.path.isdir(folder):
             return []
-        all_files = os.listdir(folder)
-        imgs = []
-        for f in all_files:
-            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
-                imgs.append(os.path.join(folder, f))
-        imgs.sort()
+        imgs = [os.path.join(folder, f) for f in sorted(os.listdir(folder))
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff'))]
         return imgs
+
+    def _copy_images_to_cleaning(self, source_images):
+        """Копирует изображения в папку клининг с сохранением имен"""
+        cleaning_folder = self.chapter_paths["cleaning_folder"]
+
+        for i, src_path in enumerate(source_images):
+            try:
+                # Сохраняем оригинальное имя файла
+                filename = os.path.basename(src_path)
+                dst_path = os.path.join(cleaning_folder, filename)
+
+                # Если файл уже существует, добавляем номер
+                if os.path.exists(dst_path):
+                    base, ext = os.path.splitext(filename)
+                    counter = 1
+                    while os.path.exists(dst_path):
+                        dst_path = os.path.join(cleaning_folder, f"{base}_{counter}{ext}")
+                        counter += 1
+
+                import shutil
+                shutil.copy2(src_path, dst_path)
+                logger.info(f"Скопирован файл: {filename}")
+
+            except Exception as e:
+                logger.error(f"Ошибка копирования {src_path}: {str(e)}")
+
+    def check_sync_needed(self):
+        """Проверяет необходимость синхронизации"""
+        config_path = os.path.join(self.chapter_paths["cleaning_folder"], "image_source_config.json")
+
+        if not os.path.exists(config_path):
+            return
+
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                source_type = config.get("source")
+        except:
+            return
+
+        # Проверяем только если изначально брали из загрузки
+        if source_type == "upload":
+            # Проверяем появились ли файлы в предобработке
+            save_folder = os.path.join(self.chapter_paths["enhanced_folder"], "Save")
+            if os.path.exists(save_folder):
+                save_images = self._get_imgs_from_folder(save_folder)
+                if save_images and not hasattr(self, '_sync_offered'):
+                    self._sync_offered = True
+                    self._show_sync_dialog(save_images)
+
+    def _show_sync_dialog(self, new_images):
+        """Показывает диалог синхронизации"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QRadioButton, QPushButton, QButtonGroup, QHBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Обнаружены новые изображения")
+        dialog.setModal(True)
+        dialog.setFixedWidth(500)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        label = QLabel("В папке предобработки появились новые изображения.\nВыберите действие:")
+        label.setStyleSheet("font-size: 14px; margin-bottom: 15px;")
+        layout.addWidget(label)
+
+        button_group = QButtonGroup()
+
+        # Вариант 1: Обновить
+        update_radio = QRadioButton("Обновить изображения из предобработки")
+        update_radio.setChecked(True)
+        button_group.addButton(update_radio, 1)
+        layout.addWidget(update_radio)
+
+        update_desc = QLabel("Все текущие изображения будут заменены новыми из предобработки")
+        update_desc.setStyleSheet("color: #888; margin-left: 25px; margin-bottom: 10px;")
+        layout.addWidget(update_desc)
+
+        # Вариант 2: Игнорировать
+        ignore_radio = QRadioButton("Продолжить с текущими изображениями")
+        button_group.addButton(ignore_radio, 2)
+        layout.addWidget(ignore_radio)
+
+        ignore_desc = QLabel("Новые изображения будут проигнорированы")
+        ignore_desc.setStyleSheet("color: #888; margin-left: 25px; margin-bottom: 10px;")
+        layout.addWidget(ignore_desc)
+
+        # Кнопки
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        ok_btn = QPushButton("Применить")
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7E1E9F;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+            }
+            QPushButton:hover {
+                background-color: #9E3EAF;
+            }
+        """)
+        ok_btn.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_btn)
+
+        layout.addLayout(button_layout)
+
+        if dialog.exec() == QDialog.Accepted:
+            if button_group.checkedId() == 1:
+                # Обновляем изображения
+                self._update_images_from_source(new_images)
+
+    def _update_images_from_source(self, new_images):
+        """Обновляет изображения из нового источника"""
+        cleaning_folder = self.chapter_paths["cleaning_folder"]
+
+        # Очищаем папку клининг
+        for file in os.listdir(cleaning_folder):
+            if file.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
+                try:
+                    os.remove(os.path.join(cleaning_folder, file))
+                except:
+                    pass
+
+        # Копируем новые изображения
+        self._copy_images_to_cleaning(new_images)
+
+        # Перезагружаем изображения
+        self.img_paths = self._get_imgs_from_folder(cleaning_folder)
+        self.force_load_imgs()
 
     def _init_top_bar(self):
         """Инициализация верхней панели"""
@@ -707,12 +800,12 @@ class CleaningWindow(QWidget):
             if e.button() == Qt.LeftButton:
                 self.viewer.cur_page = i
                 self.viewer.display_current_page()
-                self.update_active_thumb(i)
+                self.upd_active_thumb(i)
             e.accept()
 
         return on_click
 
-    def update_active_thumb(self, act_i):
+    def upd_active_thumb(self, act_i):
         """Обновляет активную миниатюру"""
         for i, (lbl, idx) in enumerate(zip(self.thumb_labels, self.idx_labels)):
             if i == act_i:
@@ -734,7 +827,7 @@ class CleaningWindow(QWidget):
 
         # Обновляем статусы после установки рамок
         for i in range(len(self.thumb_labels)):
-            self.update_thumb_status(i)
+            self.upd_thumb_status(i)
 
     def _create_right_panel(self):
         """Создание правой панели управления"""
@@ -853,28 +946,28 @@ class CleaningWindow(QWidget):
         self.cb_text = QCheckBox("Текст")
         self.cb_text.setChecked(self.detect_cls['Text']['enabled'])
         self.cb_text.setStyleSheet("color:white;")
-        self.cb_text.stateChanged.connect(lambda s: self._update_class_enabled('detect', 'Text', s))
+        self.cb_text.stateChanged.connect(lambda s: self._upd_class_enabled('detect', 'Text', s))
         classes_lay.addWidget(self.cb_text)
 
         # Сложный текст
         self.cb_complex_text = QCheckBox("Сложный текст")
         self.cb_complex_text.setChecked(self.detect_cls['ComplexText']['enabled'])
         self.cb_complex_text.setStyleSheet("color:white;")
-        self.cb_complex_text.stateChanged.connect(lambda s: self._update_class_enabled('detect', 'ComplexText', s))
+        self.cb_complex_text.stateChanged.connect(lambda s: self._upd_class_enabled('detect', 'ComplexText', s))
         classes_lay.addWidget(self.cb_complex_text)
 
         # Звуки
         self.cb_sound = QCheckBox("Звуки")
         self.cb_sound.setChecked(self.detect_cls['Sound']['enabled'])
         self.cb_sound.setStyleSheet("color:white;")
-        self.cb_sound.stateChanged.connect(lambda s: self._update_class_enabled('detect', 'Sound', s))
+        self.cb_sound.stateChanged.connect(lambda s: self._upd_class_enabled('detect', 'Sound', s))
         classes_lay.addWidget(self.cb_sound)
 
         # Фоновый текст
         self.cb_fontext = QCheckBox("Фоновый текст")
         self.cb_fontext.setChecked(self.detect_cls['FonText']['enabled'])
         self.cb_fontext.setStyleSheet("color:white;")
-        self.cb_fontext.stateChanged.connect(lambda s: self._update_class_enabled('detect', 'FonText', s))
+        self.cb_fontext.stateChanged.connect(lambda s: self._upd_class_enabled('detect', 'FonText', s))
         classes_lay.addWidget(self.cb_fontext)
 
         detection_lay.addLayout(classes_lay)
@@ -894,7 +987,7 @@ class CleaningWindow(QWidget):
         self.expand_slider.setMinimum(0)
         self.expand_slider.setMaximum(20)
         self.expand_slider.setValue(self.saved_detect_exp)
-        self.expand_slider.valueChanged.connect(self.on_detect_expand_val_changed)
+        self.expand_slider.valueChanged.connect(self.on_detect_exp_val_changed)
         self.expand_slider.setStyleSheet("QSlider::groove:horizontal{height:4px;background:#666;}"
                                          "QSlider::handle:horizontal{width:10px;background:#fff;margin:-3px 0;}")
 
@@ -948,25 +1041,25 @@ class CleaningWindow(QWidget):
         self.cb_segm_text = QCheckBox("Текст")
         self.cb_segm_text.setChecked(self.segm_cls['Text']['enabled'])
         self.cb_segm_text.setStyleSheet("color:white;")
-        self.cb_segm_text.stateChanged.connect(lambda state: self._update_class_enabled('segm', 'Text', state))
+        self.cb_segm_text.stateChanged.connect(lambda state: self._upd_class_enabled('segm', 'Text', state))
         segm_classes_lay.addWidget(self.cb_segm_text)
 
         self.cb_textsegm = QCheckBox("Сложный текст")
         self.cb_textsegm.setChecked(self.segm_cls['TextSegm']['enabled'])
         self.cb_textsegm.setStyleSheet("color:white;")
-        self.cb_textsegm.stateChanged.connect(lambda state: self._update_class_enabled('segm', 'TextSegm', state))
+        self.cb_textsegm.stateChanged.connect(lambda state: self._upd_class_enabled('segm', 'TextSegm', state))
         segm_classes_lay.addWidget(self.cb_textsegm)
 
         self.cb_segm_sound = QCheckBox("Звуки")
         self.cb_segm_sound.setChecked(self.segm_cls['Sound']['enabled'])
         self.cb_segm_sound.setStyleSheet("color:white;")
-        self.cb_segm_sound.stateChanged.connect(lambda state: self._update_class_enabled('segm', 'Sound', state))
+        self.cb_segm_sound.stateChanged.connect(lambda state: self._upd_class_enabled('segm', 'Sound', state))
         segm_classes_lay.addWidget(self.cb_segm_sound)
 
         self.cb_segm_fontext = QCheckBox("Фоновый текст")
         self.cb_segm_fontext.setChecked(self.segm_cls['FonText']['enabled'])
         self.cb_segm_fontext.setStyleSheet("color:white;")
-        self.cb_segm_fontext.stateChanged.connect(lambda state: self._update_class_enabled('segm', 'FonText', state))
+        self.cb_segm_fontext.stateChanged.connect(lambda state: self._upd_class_enabled('segm', 'FonText', state))
         segm_classes_lay.addWidget(self.cb_segm_fontext)
 
         segmentation_lay.addLayout(segm_classes_lay)
@@ -986,7 +1079,7 @@ class CleaningWindow(QWidget):
         self.segm_expand_slider.setMinimum(0)
         self.segm_expand_slider.setMaximum(20)
         self.segm_expand_slider.setValue(self.saved_segm_exp)
-        self.segm_expand_slider.valueChanged.connect(self.on_segm_expand_val_changed)
+        self.segm_expand_slider.valueChanged.connect(self.on_segm_exp_val_changed)
         self.segm_expand_slider.setStyleSheet("QSlider::groove:horizontal{height:4px;background:#666;}"
                                               "QSlider::handle:horizontal{width:10px;background:#fff;margin:-3px 0;}")
 
@@ -1161,102 +1254,100 @@ class CleaningWindow(QWidget):
         QApplication.instance().installEventFilter(self)
 
     def force_load_imgs(self):
-        """Принудительная загрузка изображений"""
+        """Загрузка изображений с корректной инициализацией буфера"""
         logger.debug(f"Загрузка {len(self.img_paths)} изображений")
 
-        # Проверка путей к папкам
-        logger.debug("Проверка путей к папкам")
+        valid_paths = [path for path in self.img_paths if os.path.exists(path)]
+        if not valid_paths:
+            logger.error("Не найдено доступных изображений")
+            return
 
-        # Загрузка всех изображений
+        self.img_paths = valid_paths
+
         for i, path in enumerate(self.img_paths):
-            if not os.path.exists(path):
-                logger.warning(f"Файл не существует: {path}")
-                continue
-
             try:
-                logger.debug(f"Загрузка {path}")
                 pixmap = QPixmap(path)
                 if pixmap.isNull():
-                    logger.warning(f"Не удалось загрузить: {path}")
                     continue
 
-                # Сохраняем изображение только если успешно загружено
-                self.viewer.pixmaps[i] = pixmap
+                # Определение оригинала
+                orig_path = self._find_original_path(path, i)
+                logger.debug(f"Страница {i}: путь={path}, оригинал={orig_path}")
 
-                # Определяем, является ли это очищенным изображением
-                is_cleaned = False
-                if path.startswith(self.chapter_paths["cleaning_folder"]) and "cleaned_" in os.path.basename(path):
-                    is_cleaned = True
+                # Загрузка оригинала
+                orig_pixmap = QPixmap(orig_path) if os.path.exists(orig_path) else pixmap.copy()
 
-                    # Ищем оригинал в папке загрузки/Enhanced/Originals
-                    orig_name = os.path.basename(path).replace("cleaned_", "")
-                    orig_path = None
-
-                    # Проверяем в Enhanced
-                    e_path = os.path.join(self.chapter_paths["enhanced_folder"], "Enhanced", orig_name)
-                    if os.path.exists(e_path):
-                        orig_path = e_path
-
-                    # Проверяем в Originals
-                    if not orig_path:
-                        o_path = os.path.join(self.chapter_paths["enhanced_folder"], "Originals", orig_name)
-                        if os.path.exists(o_path):
-                            orig_path = o_path
-
-                    # Загружаем оригинал если нашли
-                    if orig_path:
-                        orig_pixmap = QPixmap(orig_path)
-                        if not orig_pixmap.isNull():
-                            self.viewer.orig_pixmaps[i] = orig_pixmap.copy()
-                            logger.info(f"Загружен оригинал из {orig_path}")
-                        else:
-                            # Если не удалось загрузить оригинал, используем очищенное как оригинал
-                            self.viewer.orig_pixmaps[i] = pixmap.copy()
-                    else:
-                        # Если не нашли оригинал, используем очищенное как оригинал
-                        self.viewer.orig_pixmaps[i] = pixmap.copy()
-                else:
-                    # Для не очищенных изображений - обычное копирование
-                    self.viewer.orig_pixmaps[i] = pixmap.copy()
-
-                self.viewer.page_loading_status[i] = True
-
-                # Инициализируем буфер
+                # Инициализация буфера с правильными копиями
                 if i not in self.circ_buf:
                     self.circ_buf[i] = {
-                        0: None,  # Бэкап из другого этапа
-                        1: pixmap.copy(),  # Сохраняем текущее изображение как базовое
-                        2: None,  # После первой операции
-                        3: None  # После второй операции
+                        0: QPixmap(orig_pixmap),  # Оригинал
+                        1: QPixmap(pixmap),  # Текущее состояние
+                        2: None,  # Промежуточное 1
+                        3: None  # Промежуточное 2
                     }
+                    logger.debug(f"Инициализация буфера для страницы {i}")
 
-                # Инициализируем статус
-                self.img_status[i] = 'saved'  # Начальный статус - сохранено
+                # Установка в viewer
+                self.viewer.pixmaps[i] = pixmap
+                self.viewer.orig_pixmaps[i] = orig_pixmap
+                self.viewer.page_loading_status[i] = True
 
-                # Обновляем миниатюру
+                # Обновление остальных компонентов
                 if i < len(self.thumb_labels):
-                    tw = THUMB_W
-                    th = tw * 2
-                    scaled = pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    self.thumb_labels[i].setPixmap(scaled)
-                    self.update_thumb_status(i)
-            except Exception as e:
-                logger.error(f"При загрузке {path}: {str(e)}")
+                    self.thumb_labels[i].setPixmap(
+                        pixmap.scaled(THUMB_W, THUMB_W * 2, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-        # Создаем слои для рисования только для успешно загруженных изображений
-        for i in range(len(self.img_paths)):
-            if i in self.viewer.pixmaps and not self.viewer.pixmaps[i].isNull():
+                # Инициализация слоя рисования
                 if i not in self.viewer.draw_layers:
-                    # Создаем слой рисования
-                    w, h = self.viewer.pixmaps[i].width(), self.viewer.pixmaps[i].height()
-                    layer = QPixmap(w, h)
+                    layer = QPixmap(pixmap.width(), pixmap.height())
                     layer.fill(Qt.transparent)
                     self.viewer.draw_layers[i] = layer
 
-        # Обновляем отображение
+            except Exception as e:
+                logger.error(f"Ошибка загрузки {path}: {str(e)}")
+
+        # Проверка корректности текущей страницы
+        if self.viewer.cur_page >= len(self.img_paths):
+            self.viewer.cur_page = 0
+
         self.viewer.display_current_page()
 
-    def update_thumb_no_mask(self, page_idx):
+    def _find_original_path(self, current_path, index):
+        """Поиск пути к оригинальному изображению в Предобработка/Originals"""
+        # Извлекаем базовое имя файла
+        filename = os.path.basename(current_path)
+        base_name = os.path.splitext(filename)[0]
+
+        # Строим путь к оригиналу в папке Предобработка/Originals
+        originals_folder = self.chapter_paths.get("originals_folder", "")
+        enhanced_originals = os.path.join(self.chapter_paths.get("enhanced_folder", ""), "Originals")
+
+        # Варианты имен для поиска
+        possible_names = [
+            f"{base_name}.png",
+            f"{base_name}.jpg",
+            f"{index + 1:04d}.png",
+            f"{index + 1:04d}.jpg"
+        ]
+
+        # Сначала проверяем папку originals_folder
+        if os.path.isdir(originals_folder):
+            for name in possible_names:
+                orig_path = os.path.join(originals_folder, name)
+                if os.path.exists(orig_path):
+                    return orig_path
+
+        # Затем проверяем папку enhanced_originals
+        if os.path.isdir(enhanced_originals):
+            for name in possible_names:
+                orig_path = os.path.join(enhanced_originals, name)
+                if os.path.exists(orig_path):
+                    return orig_path
+
+        # Если оригинал не найден, возвращаем текущий путь
+        return current_path
+
+    def upd_thumb_no_mask(self, page_idx):
         """Обновляет миниатюру без масок"""
         if 0 <= page_idx < len(self.thumb_labels):
             try:
@@ -1272,173 +1363,105 @@ class CleaningWindow(QWidget):
                 th = tw * 2
                 scaled = pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.thumb_labels[page_idx].setPixmap(scaled)
-                self.update_thumb_status(page_idx)
+                self.upd_thumb_status(page_idx)
             except Exception as e:
                 # Логгируем ошибку для отладки
                 logger.error(f"Ошибка при обновлении миниатюры {page_idx}: {str(e)}")
 
-    def update_thumb_status(self, page_idx):
-        """Обновляет цветовой индикатор статуса миниатюры"""
+    def upd_thumb_status(self, page_idx):
         if not (0 <= page_idx < len(self.idx_labels)):
             return
 
-        # Получаем текущий статус
         status = self.img_status.get(page_idx, 'saved')
 
-        # Проверяем наличие масок для корректного индикатора
-        has_masks = False
+        has_active_masks = False
         if page_idx in self.viewer.masks:
             for mask in self.viewer.masks[page_idx]:
                 if not (hasattr(mask, 'deleted') and mask.deleted):
-                    has_masks = True
+                    has_active_masks = True
                     break
 
-        # Если есть маски, статус должен быть 'modified'
-        if has_masks and status == 'saved':
-            status = 'modified'
-            self.img_status[page_idx] = 'modified'
-
-        # Проверяем слой рисования
+        has_drawing = False
         if page_idx in self.viewer.draw_layers and not self.viewer.draw_layers[page_idx].isNull():
             qimg = self.viewer.draw_layers[page_idx].toImage()
             for y in range(0, qimg.height(), 10):
                 for x in range(0, qimg.width(), 10):
                     alpha = (qimg.pixel(x, y) >> 24) & 0xFF
                     if alpha > 0:
-                        status = 'modified'
-                        self.img_status[page_idx] = 'modified'
+                        has_drawing = True
                         break
-                if status == 'modified':
+                if has_drawing:
                     break
 
-        # Определяем цвет индикатора
-        idx_label = self.idx_labels[page_idx]
+        # Логика определения статуса
+        if status == 'unsaved':
+            # Красный приоритет
+            final_status = 'unsaved'
+        elif has_active_masks or has_drawing:
+            # Желтый если есть маски
+            final_status = 'modified'
+            self.img_status[page_idx] = 'modified'
+        else:
+            # Зеленый если нет масок
+            final_status = 'saved'
+            self.img_status[page_idx] = 'saved'
 
-        # Проверяем, активна ли миниатюра
+        idx_label = self.idx_labels[page_idx]
         is_active = (page_idx == self.viewer.cur_page)
 
-        # Рамка в зависимости от активности
-        if is_active:
-            border_style = "border:2px solid #7E1E9F;"
-        else:
-            border_style = "border:2px solid transparent;"
+        border_style = "border:2px solid #7E1E9F;" if is_active else "border:2px solid transparent;"
 
-        # Определяем цвет ТЕКСТА для номера страницы в зависимости от статуса
-        if status == 'saved':
-            # Зеленый для сохраненных
-            text_color = "#22AA22"
-        elif status == 'modified':
-            # Желтый для измененных
-            text_color = "#DDBB00"
-        else:  # 'unsaved'
-            # Красный для несохраненных
-            text_color = "#DD2200"
+        color_map = {
+            'saved': "#22AA22",  # Зеленый
+            'modified': "#DDBB00",  # Желтый
+            'unsaved': "#DD2200"  # Красный
+        }
 
-        # Применяем стиль: ЦВЕТ ТЕКСТА меняется, фон остается стандартным
+        text_color = color_map.get(final_status, "#22AA22")
+
         idx_style = f"QLabel{{color:{text_color};background-color:#222;font-size:14px;font-weight:bold;{border_style}"
         idx_style += "border-bottom-left-radius:8px;border-bottom-right-radius:8px;}"
 
         idx_label.setStyleSheet(idx_style)
 
     def is_valid_page_idx(self, page_idx):
-        """Проверяет корректность индекса страницы"""
-        if page_idx is None:
-            logger.error("Индекс страницы None")
+        if page_idx is None or not isinstance(page_idx, int) or page_idx < 0:
             return False
-
-        if not isinstance(page_idx, int):
-            logger.error(f"Индекс страницы не является целым числом: {page_idx}")
-            return False
-
-        # Проверяем только на выход за нижнюю границу
-        if page_idx < 0:
-            logger.error(f"Отрицательный индекс страницы {page_idx}")
-            return False
-
-        # Игнорируем проверки для известных проблемных индексов
-        if page_idx in [0, 4, 45]:
-            logger.debug(f"Индекс страницы {page_idx} - проблемный, но игнорируем проверки")
-            return True
-
-        # Проверяем только pixmap текущей страницы
-        if page_idx == self.viewer.cur_page:
-            if page_idx not in self.viewer.pixmaps:
-                logger.debug(f"Отсутствует pixmap для текущей страницы {page_idx}, но продолжаем")
-                return True
-
-            if self.viewer.pixmaps[page_idx].isNull():
-                logger.debug(f"Pixmap для текущей страницы {page_idx} пуст, но продолжаем")
-                return True
-
         return True
 
-    def update_comb_mask(self, page_idx):
-        """Обновляет комбинированную маску на основе визуальных масок"""
+    def upd_comb_mask(self, page_idx):
         if not self.is_valid_page_idx(page_idx):
+            logger.debug(f"Невалидный индекс страницы: {page_idx}")
             return None
 
         try:
-            # Обработка проблемных страниц
-            if page_idx in [0, 4, 45]:
-                # Если уже есть маска, используем её
-                if page_idx in self.comb_masks and self.comb_masks[page_idx] is not None:
-                    return self.comb_masks[page_idx]
+            if page_idx >= len(self.img_paths):
+                logger.debug(f"Индекс {page_idx} выходит за границы")
+                return None
 
-                # Размеры по умолчанию
-                default_w, default_h = 100, 100
-
-                # Если есть pixmap, используем его размеры
-                if page_idx in self.viewer.pixmaps and not self.viewer.pixmaps[page_idx].isNull():
-                    default_w = self.viewer.pixmaps[page_idx].width()
-                    default_h = self.viewer.pixmaps[page_idx].height()
-
-                # Создаем пустую маску
-                empty_mask = np.zeros((default_h, default_w), dtype=np.uint8)
-
-                # Копируем маски для проблемных страниц
-                if page_idx in self.viewer.masks and self.viewer.masks[page_idx]:
-                    for mask in self.viewer.masks[page_idx]:
-                        # Пропускаем удаленные
-                        if hasattr(mask, 'deleted') and mask.deleted:
-                            continue
-
-                        if isinstance(mask, EditableMask):
-                            rect = mask.rect()
-                            x1, y1 = max(0, int(rect.x())), max(0, int(rect.y()))
-                            x2 = min(default_w - 1, int(x1 + rect.width()))
-                            y2 = min(default_h - 1, int(y1 + rect.height()))
-
-                            if x2 > x1 and y2 > y1:
-                                cv2.rectangle(empty_mask, (x1, y1), (x2, y2), 255, -1)
-
-                self.comb_masks[page_idx] = empty_mask
-                return empty_mask
-
-            # Получаем размеры изображения
             if page_idx in self.viewer.pixmaps and not self.viewer.pixmaps[page_idx].isNull():
                 w = self.viewer.pixmaps[page_idx].width()
                 h = self.viewer.pixmaps[page_idx].height()
+                logger.debug(f"Размеры изображения {page_idx}: {w}x{h}")
             else:
+                logger.debug(f"Отсутствует pixmap для страницы {page_idx}")
                 return None
 
-            # Создаем пустую маску
             combined_mask = np.zeros((h, w), dtype=np.uint8)
             mask_found = False
+            mask_count = 0
 
-            # Обрабатываем маски детекции и сегментации
             if page_idx in self.viewer.masks:
                 for mask in self.viewer.masks[page_idx]:
                     if hasattr(mask, 'deleted') and mask.deleted:
                         continue
+                    mask_count += 1
 
-                    # Добавляем в комбинированную маску
                     if isinstance(mask, EditableMask):
-                        # Прямоугольные маски
                         rect = mask.rect()
                         x1, y1 = int(rect.x()), int(rect.y())
                         x2, y2 = int(x1 + rect.width()), int(y1 + rect.height())
 
-                        # Проверка границ
                         x1 = max(0, min(x1, w - 1))
                         y1 = max(0, min(y1, h - 1))
                         x2 = max(0, min(x2, w - 1))
@@ -1449,7 +1472,6 @@ class CleaningWindow(QWidget):
                             mask_found = True
 
                     elif isinstance(mask, EditablePolygonMask):
-                        # Полигональные маски
                         polygon = mask.polygon()
                         points = []
                         for i in range(polygon.count()):
@@ -1463,97 +1485,44 @@ class CleaningWindow(QWidget):
                             cv2.fillPoly(combined_mask, [pts], 255)
                             mask_found = True
 
-                    elif isinstance(mask, BrushStroke):
-                        # Штрихи кисти
-                        if not mask.path.isEmpty():
-                            temp_mask = np.zeros((h, w), dtype=np.uint8)
-                            path = mask.path
-                            points = []
+            logger.debug(f"Обработано {mask_count} масок")
 
-                            # Позиция маски
-                            pos_x, pos_y = 0, 0
-                            if mask.pos() is not None:
-                                pos_x, pos_y = mask.pos().x(), mask.pos().y()
-
-                            # Преобразуем путь в точки
-                            for i in range(path.elementCount()):
-                                elem = path.elementAt(i)
-                                x = max(0, min(int(elem.x + pos_x), w - 1))
-                                y = max(0, min(int(elem.y + pos_y), h - 1))
-                                points.append((x, y))
-
-                            # Рисуем путь
-                            if len(points) > 1:
-                                for i in range(1, len(points)):
-                                    thickness = getattr(mask, 'stroke_size', 5)
-                                    cv2.line(temp_mask, points[i - 1], points[i], 255,
-                                             thickness=thickness, lineType=cv2.LINE_AA)
-
-                            elif len(points) == 1:
-                                x, y = points[0]
-                                radius = max(1, getattr(mask, 'stroke_size', 5) // 2)
-                                cv2.circle(temp_mask, (x, y), radius, 255, -1)
-
-                            # Добавляем в основную маску
-                            if np.any(temp_mask):
-                                cv2.bitwise_or(combined_mask, temp_mask, combined_mask)
-                                mask_found = True
-
-            # Обрабатываем слой рисования
             if page_idx in self.viewer.draw_layers and not self.viewer.draw_layers[page_idx].isNull():
                 qimg = self.viewer.draw_layers[page_idx].toImage()
                 draw_mask = np.zeros((h, w), dtype=np.uint8)
                 pixels_found = 0
 
-                # Проверяем все пиксели
                 for y in range(h):
                     for x in range(w):
                         if x < qimg.width() and y < qimg.height():
-                            # Получаем значение альфа-канала
                             pixel = qimg.pixel(x, y)
                             alpha = (pixel >> 24) & 0xFF
                             if alpha > 0:
                                 draw_mask[y, x] = 255
                                 pixels_found += 1
 
-                # Добавляем в основную маску
                 if pixels_found > 0:
                     cv2.bitwise_or(combined_mask, draw_mask, combined_mask)
                     mask_found = True
+                    logger.debug(f"Добавлено {pixels_found} пикселей из слоя рисования")
 
-            # Применяем морфологические операции
             if mask_found:
-                # Закрытие маски для заполнения малых дырок
                 kernel = np.ones((3, 3), np.uint8)
                 combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
-
-                # Небольшое расширение
                 combined_mask = cv2.dilate(combined_mask, kernel, iterations=1)
 
-            # Сохраняем маску
             self.comb_masks[page_idx] = combined_mask
-
+            logger.debug(f"Маска создана, найдено пикселей: {np.sum(combined_mask > 0)}")
             return combined_mask
 
         except Exception as e:
             logger.error(f"Ошибка создания маски для страницы {page_idx}: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
             return None
-
-    def _update_prog_bar(self, prog_bar, val, total, msg=""):
-        """Обновляет прогресс-бар в главном потоке"""
-        prog_bar.setRange(0, total)
-        prog_bar.setValue(val)
-        if msg:
-            prog_bar.setFormat(msg)
-        prog_bar.setVisible(True)
-        QApplication.processEvents()
 
     def lock_ui(self, operation):
         """Блокирует интерфейс во время выполнения операции"""
         try:
-            self.processing = True
+            self.proc = True
             self.curr_op = operation
             logger.info(f"Интерфейс заблокирован: операция {operation}")
 
@@ -1575,7 +1544,7 @@ class CleaningWindow(QWidget):
     def unlock_ui(self):
         """Разблокирует интерфейс после операции"""
         try:
-            self.processing = False
+            self.proc = False
             self.curr_op = None
             logger.info("Интерфейс разблокирован")
 
@@ -1603,7 +1572,7 @@ class CleaningWindow(QWidget):
     def clean_img(self):
         """Очистка изображения с помощью LaMa"""
         # Проверка активного процесса
-        if self.processing:
+        if self.proc:
             QMessageBox.warning(self, "Предупреждение",
                                 f"Уже выполняется операция: {self.curr_op}. Дождитесь её завершения.")
             return
@@ -1668,7 +1637,7 @@ class CleaningWindow(QWidget):
 
         try:
             # Сохраняем текущее состояние в буфер
-            self.save_to_circ_buf(page_idx)
+            self.save_to_buf(page_idx)
 
             # Получаем текущее изображение
             current_pixmap = None
@@ -1715,6 +1684,10 @@ class CleaningWindow(QWidget):
                     try:
                         # Пропускаем удаленные
                         if hasattr(mask_item, 'deleted') and mask_item.deleted:
+                            continue
+
+                        # НОВОЕ: Пропускаем уже обработанные маски
+                        if hasattr(mask_item, 'processed') and mask_item.processed:
                             continue
 
                         if isinstance(mask_item, EditableMask):
@@ -1773,13 +1746,12 @@ class CleaningWindow(QWidget):
             except Exception as e:
                 logger.error(f"Ошибка при обработке слоя рисования: {str(e)}")
 
-            # 3. Используем comb_masks
+            # 3. Используем comb_masks (только необработанные)
             try:
                 if page_idx in self.comb_masks and np.any(self.comb_masks[page_idx]):
                     combined_mask = self.comb_masks[page_idx]
                     # Проверяем размер
                     if combined_mask.shape[0] == h and combined_mask.shape[1] == w:
-                        # Если размеры совпадают, просто объединяем
                         mask = cv2.bitwise_or(mask, combined_mask)
                         masks_drawn = True
                     else:
@@ -1804,52 +1776,34 @@ class CleaningWindow(QWidget):
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
             mask = cv2.dilate(mask, kernel, iterations=1)
 
-            # Отладка
-            debug_dir = self.chapter_paths["cleaning_folder"]
-            os.makedirs(debug_dir, exist_ok=True)
-
-            try:
-                debug_path = os.path.join(debug_dir, f"direct_mask_{page_idx}.png")
-                cv2.imwrite(debug_path, mask)
-            except Exception as e:
-                logger.warning(f"Не удалось сохранить отладочную маску: {str(e)}")
-
-            # Имя файла результата
-            timestamp = int(time.time())
-            original_filename = os.path.basename(self.img_paths[page_idx])
-            base_name, ext = os.path.splitext(original_filename)
-            output_filename = f"{base_name}_cleaned_{timestamp}{ext}"
-            output_path = os.path.join(debug_dir, output_filename)
+            # НЕ СОХРАНЯЕМ отладочную маску на диск
 
             # Показываем прогресс
             pixel_count = np.sum(mask > 0)
             logger.info(f"Создана маска с {pixel_count} непрозрачными пикселями")
-            self._update_prog_bar(
+            self._upd_prog_bar(
                 self.clean_prog, self.clean_curr_page_idx, self.clean_total_pages,
                 f"Очистка страницы {page_idx + 1}/{self.clean_total_pages}: {pixel_count} пикселей")
 
-            # Воркер для очистки
+            # Воркер для очистки БЕЗ сохранения на диск
             worker = ImgCleanWorker(
                 self.lama,
                 current_pixmap,
                 mask,
-                page_idx,
-                debug_dir,
-                output_path
+                page_idx
             )
 
             # Сигналы
             worker.prog.connect(lambda v, t, m, idx=page_idx:
-                                self._update_prog_bar(
+                                self._upd_prog_bar(
                                     self.clean_prog,
                                     self.clean_curr_page_idx + v / t,
                                     self.clean_total_pages,
                                     f"Страница {idx + 1}/{self.clean_total_pages}: {m}"))
             worker.err.connect(lambda e: QMessageBox.critical(self, "Ошибка", e))
 
-            # Для обработки следующей страницы
-            worker.done_img.connect(lambda idx, path, pixmap: self._on_img_cleaned_batch(idx, path, pixmap))
-
+            # Для обработки следующей страницы (БЕЗ пути к файлу)
+            worker.done_img.connect(self._on_img_cleaned_batch)
             # Запускаем очистку
             self.clean_workers = [worker]
             worker.start()
@@ -1864,79 +1818,73 @@ class CleaningWindow(QWidget):
             self.clean_curr_page_idx += 1
             QTimer.singleShot(100, self.process_next_clean_page)
 
-    def _on_img_cleaned_batch(self, page_idx, output_path, result_pixmap):
-        """Обработка завершения очистки изображения в пакетном режиме"""
+    def _on_img_cleaned_batch(self, page_idx, result_pixmap):
         try:
-            # Обрабатываем результат
             if not result_pixmap.isNull():
                 logger.info(f"Успешно очищено изображение для страницы {page_idx + 1}")
 
-                # Обновляем изображение в просмотрщике
                 self.viewer.pixmaps[page_idx] = result_pixmap
 
-                # Очищаем слой рисования и маски
+                if page_idx not in self.circ_buf:
+                    self.circ_buf[page_idx] = {
+                        0: None,
+                        1: None,
+                        2: None,
+                        3: None
+                    }
+
+                if self.circ_buf[page_idx][1] is not None:
+                    self.circ_buf[page_idx][2] = self.circ_buf[page_idx][1].copy()
+
+                self.circ_buf[page_idx][1] = result_pixmap.copy()
+
+                # Полное удаление масок
+                if page_idx in self.viewer.masks:
+                    for mask in self.viewer.masks[page_idx]:
+                        if mask.scene():
+                            self.viewer.scene_.removeItem(mask)
+                    self.viewer.masks[page_idx] = []
+
+                # Очистка слоя рисования
                 if page_idx in self.viewer.draw_layers:
                     self.viewer.draw_layers[page_idx].fill(Qt.transparent)
                     if page_idx in self.viewer.draw_items:
                         self.viewer.draw_items[page_idx].setPixmap(self.viewer.draw_layers[page_idx])
 
-                # Удаляем маски
-                if page_idx in self.viewer.masks:
-                    for mask in self.viewer.masks[page_idx]:
-                        mask.deleted = True
-                        mask.setVisible(False)
-                    # Очищаем список
-                    self.viewer.masks[page_idx] = []
-
-                # Очищаем комбинированную маску
+                # Очистка комбинированной маски
                 if page_idx in self.comb_masks:
-                    h, w = self.comb_masks[page_idx].shape
-                    self.comb_masks[page_idx] = np.zeros((h, w), dtype=np.uint8)
+                    del self.comb_masks[page_idx]
 
-                # Обновляем статус
-                self.img_status[page_idx] = 'unsaved'  # Не сохранено после изменений
+                self.img_status[page_idx] = 'unsaved'
 
-                # Если текущая страница, обновляем отображение
                 if page_idx == self.viewer.cur_page:
                     self.viewer.display_current_page()
 
-                # Обновляем миниатюру
                 tw = THUMB_W
                 th = tw * 2
                 scaled = result_pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.thumb_labels[page_idx].setPixmap(scaled)
-                self.update_thumb_status(page_idx)
-            else:
-                logger.error(f"Получен пустой результат для страницы {page_idx}")
+                self.upd_thumb_status(page_idx)
 
-            # Следующая страница
             self.clean_curr_page_idx += 1
-
-            # Очищаем воркер
             self.clean_workers = []
-
-            # Запускаем следующую
             QTimer.singleShot(100, self.process_next_clean_page)
 
         except Exception as e:
             logger.error(f"Ошибка при обработке результата очистки: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-
-            # Двигаемся дальше
             self.clean_curr_page_idx += 1
             QTimer.singleShot(100, self.process_next_clean_page)
 
-    def force_update_display(self):
+    def force_upd_display(self):
         """Принудительное обновление отображения"""
         self.viewer.display_current_page()
 
-    def update_all_thumbs(self):
+    def upd_all_thumbs(self):
         """Обновляет все миниатюры"""
         for page_idx in range(len(self.img_paths)):
             if page_idx in self.viewer.pixmaps and not self.viewer.pixmaps[page_idx].isNull():
                 # Обновляем миниатюру
-                self.update_thumb_no_mask(page_idx)
+                self.upd_thumb_no_mask(page_idx)
 
     def set_drawing_tool(self, mode):
         """Установка режима рисования"""
@@ -1984,7 +1932,7 @@ class CleaningWindow(QWidget):
         elif hasattr(self.viewer, 'setDrawSize'):
             self.viewer.setDrawSize(value)
 
-    def on_detect_expand_val_changed(self, value):
+    def on_detect_exp_val_changed(self, value):
         """Обработка изменения значения расширения маски"""
         self.expand_value.setText(str(value))
         self.saved_detect_exp = value
@@ -1994,12 +1942,12 @@ class CleaningWindow(QWidget):
                 # Обновляем все страницы
                 for page_idx in range(len(self.img_paths)):
                     if page_idx in self.viewer.masks:
-                        self._update_masks_exp(page_idx, 'detect', value)
+                        self._upd_masks_exp(page_idx, 'detect', value)
             else:
                 # Только текущую
-                self._update_masks_exp(self.viewer.cur_page, 'detect', value)
+                self._upd_masks_exp(self.viewer.cur_page, 'detect', value)
 
-    def on_segm_expand_val_changed(self, value):
+    def on_segm_exp_val_changed(self, value):
         """Обработка изменения значения расширения маски сегментации"""
         self.segm_expand_value.setText(str(value))
         self.saved_segm_exp = value
@@ -2009,26 +1957,26 @@ class CleaningWindow(QWidget):
                 # Обновляем все страницы
                 for page_idx in range(len(self.img_paths)):
                     if page_idx in self.viewer.masks:
-                        self._update_masks_exp(page_idx, 'segm', value)
+                        self._upd_masks_exp(page_idx, 'segm', value)
             else:
                 # Только текущую
-                self._update_masks_exp(self.viewer.cur_page, 'segm', value)
+                self._upd_masks_exp(self.viewer.cur_page, 'segm', value)
 
     def on_prev_page(self):
         """Переход на предыдущую страницу"""
         if self.viewer.previousPage():
-            self.update_active_thumb(self.viewer.cur_page)
+            self.upd_active_thumb(self.viewer.cur_page)
             self.prev_page_btn.setEnabled(self.viewer.cur_page > 0)
             self.next_page_btn.setEnabled(True)
 
     def on_next_page(self):
         """Переход на следующую страницу"""
         if self.viewer.nextPage():
-            self.update_active_thumb(self.viewer.cur_page)
+            self.upd_active_thumb(self.viewer.cur_page)
             self.next_page_btn.setEnabled(self.viewer.cur_page < len(self.viewer.pages) - 1)
             self.prev_page_btn.setEnabled(True)
 
-    def _update_masks_exp(self, page_idx, mask_type, expansion_value):
+    def _upd_masks_exp(self, page_idx, mask_type, expansion_value):
         """Обновляет размер масок на странице с учетом масштаба"""
         if page_idx not in self.viewer.masks:
             return
@@ -2043,9 +1991,6 @@ class CleaningWindow(QWidget):
                 if hasattr(mask, 'class_name'):
                     cls = mask.class_name
                     class_counts[cls] = class_counts.get(cls, 0) + 1
-
-            if class_counts:
-                logger.debug(f"Маски на странице {page_idx}: {class_counts}")
 
             # Масштаб отображения
             scale_factor = 1.0
@@ -2077,11 +2022,6 @@ class CleaningWindow(QWidget):
                         original_data.append((center_x, center_y, original_width, original_height))
                         masks_to_update.append(mask)
 
-                    elif isinstance(mask, EditablePolygonMask):
-                        # Для полигонов требуется другая логика расширения
-                        # (можно добавить при необходимости)
-                        pass
-
             # Обновляем размеры
             for mask, (cx, cy, w, h) in zip(masks_to_update, original_data):
                 if isinstance(mask, EditableMask):
@@ -2097,10 +2037,10 @@ class CleaningWindow(QWidget):
 
             # Обновляем маску и отображение
             window = self.window()
-            if hasattr(window, 'update_comb_mask'):
-                window.update_comb_mask(page_idx)
+            if hasattr(window, 'upd_comb_mask'):
+                window.upd_comb_mask(page_idx)
             else:
-                self.update_comb_mask(page_idx)
+                self.upd_comb_mask(page_idx)
 
             # Только для текущей страницы
             if page_idx == self.viewer.cur_page:
@@ -2116,12 +2056,11 @@ class CleaningWindow(QWidget):
             logger.error(traceback.format_exc())
 
     def _on_detection_completed(self, page_idx, results):
-        """Обработчик завершения детекции для страницы"""
         try:
             if results:
                 logger.info(f"Получены результаты детекции для страницы {page_idx}: {len(results)} объектов")
-                self.sync_detection_classes()
-                # Сохраняем текущую трансформацию и масштаб
+                self.sync_det_classes()
+
                 current_transform = None
                 current_scale = 1.0
                 if hasattr(self.viewer, 'transform'):
@@ -2129,18 +2068,12 @@ class CleaningWindow(QWidget):
                 if hasattr(self.viewer, 'scale_factor'):
                     current_scale = self.viewer.scale_factor
 
-                # Определяем размеры для проблемных страниц
                 img_shape = None
-                if page_idx in [0, 4, 45]:
-                    # Размеры по умолчанию или из pixmap если доступно
-                    default_w, default_h = 800, 1126
-                    if page_idx in self.viewer.pixmaps and not self.viewer.pixmaps[page_idx].isNull():
-                        default_w = self.viewer.pixmaps[page_idx].width()
-                        default_h = self.viewer.pixmaps[page_idx].height()
-                    img_shape = (default_h, default_w)
-                    logger.info(f"Установлены размеры {img_shape} для проблемной страницы {page_idx}")
+                if page_idx in self.viewer.pixmaps and not self.viewer.pixmaps[page_idx].isNull():
+                    w = self.viewer.pixmaps[page_idx].width()
+                    h = self.viewer.pixmaps[page_idx].height()
+                    img_shape = (h, w)
 
-                # Обработка результатов с явным указанием масштаба и размеров
                 self.detect_mgr.process_detection_results(
                     results,
                     self.viewer,
@@ -2150,65 +2083,36 @@ class CleaningWindow(QWidget):
                     img_shape=img_shape
                 )
 
-                # Обновляем маску
-                self.update_comb_mask(page_idx)
-
-                # Обновляем миниатюру
-                self.update_thumb_no_mask(page_idx)
-
-                # Обновляем статус
+                self.upd_comb_mask(page_idx)
+                self.upd_thumb_no_mask(page_idx)
                 self.img_status[page_idx] = 'modified'
-                self.update_thumb_status(page_idx)
+                self.upd_thumb_status(page_idx)
 
-                # Если текущая, обновляем отображение
                 if page_idx == self.viewer.cur_page:
-                    # Проверяем, сколько масок на текущей странице
-                    mask_count = 0
-                    if page_idx in self.viewer.masks:
-                        for mask in self.viewer.masks[page_idx]:
-                            if not (hasattr(mask, 'deleted') and mask.deleted):
-                                mask_count += 1
-                    logger.info(f"Страница {page_idx} содержит {mask_count} активных масок")
-
-                    # Принудительно обновляем отображение
                     QTimer.singleShot(100, lambda: self.viewer.display_current_page())
-
-                    # Восстанавливаем трансформацию, если была сохранена
                     if current_transform is not None:
                         QTimer.singleShot(200, lambda: self.viewer.setTransform(current_transform))
 
-                # Обновляем интерфейс
                 QApplication.processEvents()
             else:
                 logger.warning(f"Не найдено объектов на странице {page_idx + 1}")
-                QMessageBox.warning(self, "Предупреждение", f"Не найдено объектов на странице {page_idx + 1}.")
 
         except Exception as e:
             logger.error(f"Ошибка при обработке результатов детекции: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-
         finally:
-            # Проверка завершения
             current_progress = self.current_page_index if hasattr(self, 'current_page_index') else 0
             total_pages = self.total_pages if hasattr(self, 'total_pages') else 1
 
             if current_progress >= total_pages:
-                # Завершение процесса
-                self._update_prog_bar(
-                    self.detect_prog, total_pages, total_pages, "Детекция завершена")
-
-                # Обновляем миниатюры
+                self._upd_prog_bar(self.detect_prog, total_pages, total_pages, "Детекция завершена")
                 for i in range(len(self.img_paths)):
                     if i in self.viewer.masks and self.viewer.masks[i]:
-                        self.update_thumb_no_mask(i)
-
-                # Восстанавливаем интерфейс
+                        self.upd_thumb_no_mask(i)
                 self._restore_detect_btn()
                 QTimer.singleShot(PROG_HIDE_MS, lambda: self.detect_prog.setVisible(False))
                 self.unlock_ui()
 
-    def force_update_thumbnail(self, page_idx):
+    def force_upd_thumb(self, page_idx):
         """Принудительное обновление миниатюры страницы"""
         if 0 <= page_idx < len(self.thumb_labels):
             try:
@@ -2224,14 +2128,14 @@ class CleaningWindow(QWidget):
                 th = tw * 2
                 scaled = pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.thumb_labels[page_idx].setPixmap(scaled)
-                self.update_thumb_status(page_idx)
+                self.upd_thumb_status(page_idx)
             except Exception as e:
                 logger.error(f"Ошибка при обновлении миниатюры {page_idx}: {str(e)}")
 
-    def update_combined_mask_from_visual(self, page_idx):
+    def upd_comb_mask_from_visual(self, page_idx):
         """Обновляет комбинированную маску на основе визуальных элементов"""
         # Создаем комбинированную маску с учетом всех визуальных элементов
-        combined_mask = self.update_comb_mask(page_idx)
+        combined_mask = self.upd_comb_mask(page_idx)
 
         # Обновляем статус страницы
         if combined_mask is not None and np.any(combined_mask > 0):
@@ -2251,47 +2155,12 @@ class CleaningWindow(QWidget):
                 self.img_status[page_idx] = 'saved'
 
         # Обновляем индикатор статуса
-        self.update_thumb_status(page_idx)
+        self.upd_thumb_status(page_idx)
 
         # Отправляем сигнал об обновлении маски
         self.viewer.mask_updated.emit(page_idx)
 
         return combined_mask
-
-    def debug_masks_info(self, page_idx=None):
-        """Отладочная информация о масках"""
-        if page_idx is None:
-            page_idx = self.viewer.cur_page
-
-        logger.info(f"=== Отладка масок для страницы {page_idx} ===")
-
-        if page_idx not in self.viewer.masks:
-            logger.info(f"Масок для страницы {page_idx} не найдено")
-            return
-
-        total_masks = len(self.viewer.masks[page_idx])
-        visible_masks = 0
-        deleted_masks = 0
-
-        for i, mask in enumerate(self.viewer.masks[page_idx]):
-            is_deleted = hasattr(mask, 'deleted') and mask.deleted
-            is_visible = mask.isVisible()
-
-            if not is_deleted:
-                visible_masks += 1
-            else:
-                deleted_masks += 1
-
-            mask_type = getattr(mask, 'mask_type', 'unknown')
-            class_name = getattr(mask, 'class_name', 'unknown')
-
-            if isinstance(mask, EditableMask):
-                rect = mask.rect()
-                logger.info(f"  Маска {i + 1}/{total_masks}: тип={mask_type}, класс={class_name}, "
-                            f"позиция=({rect.x()},{rect.y()}), размер={rect.width()}x{rect.height()}, "
-                            f"удалена={is_deleted}, видима={is_visible}")
-
-        logger.info(f"Всего масок: {total_masks}, видимых: {visible_masks}, удаленных: {deleted_masks}")
 
     def _clear_page_masks(self, page_idx, mask_type=None):
         """Удаляет маски определенного типа на странице"""
@@ -2304,18 +2173,36 @@ class CleaningWindow(QWidget):
             self.viewer.masks[page_idx] = [m for m in self.viewer.masks[page_idx] if
                                            m not in masks_to_remove]
             if page_idx in self.comb_masks:
-                self.update_comb_mask(page_idx)
+                self.upd_comb_mask(page_idx)
+
+    def _clear_all_masks_for_page(self, page_idx):
+        """Полностью очищает все маски и слои для страницы"""
+        # Удаляем все маски
+        if page_idx in self.viewer.masks:
+            for mask in self.viewer.masks[page_idx]:
+                if mask.scene():
+                    self.viewer.scene_.removeItem(mask)
+            self.viewer.masks[page_idx] = []
+
+        # Очищаем слой рисования
+        if page_idx in self.viewer.draw_layers:
+            self.viewer.draw_layers[page_idx].fill(Qt.transparent)
+            if page_idx in self.viewer.draw_items:
+                self.viewer.draw_items[page_idx].setPixmap(self.viewer.draw_layers[page_idx])
+
+        # Удаляем комбинированную маску
+        if page_idx in self.comb_masks:
+            del self.comb_masks[page_idx]
 
     def run_detection(self):
         """Запускает процесс детекции"""
         # Проверка активного процесса
-        self.dump_detection_states()
-
-        if self.processing:
+        if self.proc:
             QMessageBox.warning(self, "Предупреждение",
                                 f"Уже выполняется операция: {self.curr_op}. Дождитесь её завершения.")
             return
-        self.sync_detection_classes()
+        self.sync_det_classes()
+        self.sync_detection_manager()  # Добавьте эту строку
 
         # Блокируем интерфейс
         self.lock_ui("Детекция")
@@ -2356,7 +2243,7 @@ class CleaningWindow(QWidget):
         self.saved_detect_exp = self.expansion_value
 
         # Флаг отмены
-        self.detect_cancelled = False
+        self.det_canc = False
 
         if self.total_pages == 0:
             QMessageBox.information(self, "Информация", "Нет страниц для обработки")
@@ -2380,10 +2267,11 @@ class CleaningWindow(QWidget):
         except:
             pass
         self.detect_btn.clicked.connect(self.run_detection)
+        self.detect_btn.setEnabled(True)
 
     def cancel_detection(self):
         """Отменяет процесс детекции"""
-        self.detect_cancelled = True
+        self.det_canc = True
         QMessageBox.information(self, "Информация",
                                 "Детекция будет отменена после завершения текущей страницы")
 
@@ -2395,7 +2283,7 @@ class CleaningWindow(QWidget):
         """Запускает детекцию объектов в выбранной области"""
         try:
             # Проверка активного процесса
-            if self.processing:
+            if self.proc:
                 QMessageBox.warning(self, "Предупреждение",
                                     f"Уже выполняется операция: {self.curr_op}. Дождитесь её завершения.")
                 return
@@ -2425,13 +2313,13 @@ class CleaningWindow(QWidget):
                             img_shape=None, offset=offset)
 
                         # Обновляем маску
-                        self.update_comb_mask(page_idx)
+                        self.upd_comb_mask(page_idx)
 
                         # Обновляем отображение
                         QTimer.singleShot(100, self.viewer.display_current_page)
 
                     # Завершаем прогресс
-                    QTimer.singleShot(0, lambda: self._update_prog_bar(
+                    QTimer.singleShot(0, lambda: self._upd_prog_bar(
                         self.detect_prog, 1, 1, "Детекция области завершена"))
 
                     # Скрываем прогресс
@@ -2459,7 +2347,7 @@ class CleaningWindow(QWidget):
     def run_segmentation(self):
         """Запускает процесс сегментации"""
         # Проверка активного процесса
-        if self.processing:
+        if self.proc:
             QMessageBox.warning(self, "Предупреждение",
                                 f"Уже выполняется операция: {self.curr_op}. Дождитесь её завершения.")
             return
@@ -2503,7 +2391,7 @@ class CleaningWindow(QWidget):
         self.saved_segm_exp = self.segm_expansion_value
 
         # Флаг отмены
-        self.segmentation_cancelled = False
+        self.segm_canc = False
 
         if self.segm_total_pages == 0:
             QMessageBox.information(self, "Информация", "Нет страниц для обработки")
@@ -2529,7 +2417,7 @@ class CleaningWindow(QWidget):
 
     def cancel_segmentation(self):
         """Отменяет процесс сегментации"""
-        self.segmentation_cancelled = True
+        self.segm_canc = True
         QMessageBox.information(self, "Информация",
                                 "Сегментация будет отменена после завершения текущей страницы")
 
@@ -2537,28 +2425,7 @@ class CleaningWindow(QWidget):
         self.segm_btn.setEnabled(False)
         self.segm_btn.setText("Отмена...")
 
-    def dump_detection_states(self):
-        """Выводит состояние всех классов детекции для отладки"""
-        logger.info("=== Состояние классов детекции ===")
-
-        # Проверка чекбоксов
-        logger.info(f"Чекбокс Text: {self.cb_text.isChecked()}")
-        logger.info(f"Чекбокс ComplexText: {self.cb_complex_text.isChecked()}")
-        logger.info(f"Чекбокс Sound: {self.cb_sound.isChecked()}")
-        logger.info(f"Чекбокс FonText: {self.cb_fontext.isChecked()}")
-
-        # Проверка словаря self.detect_cls
-        logger.info("Словарь self.detect_cls:")
-        for cls, info in self.detect_cls.items():
-            logger.info(f"- {cls}: enabled={info['enabled']}, threshold={info['threshold']}")
-
-        # Проверка словаря self.detect_mgr.detect_classes
-        if hasattr(self, 'detect_mgr') and hasattr(self.detect_mgr, 'detect_classes'):
-            logger.info("Словарь self.detect_mgr.detect_classes:")
-            for cls, info in self.detect_mgr.detect_classes.items():
-                logger.info(f"- {cls}: enabled={info['enabled']}, threshold={info['threshold']}")
-
-    def _update_class_enabled(self, model_type, cls_name, state):
+    def _upd_class_enabled(self, model_type, cls_name, state):
         """Обновляет активность класса"""
         enabled = state == Qt.Checked
 
@@ -2601,95 +2468,267 @@ class CleaningWindow(QWidget):
 
                 if hasattr(self, 'detect_mgr') and hasattr(self.detect_mgr, 'segm_classes'):
                     self.detect_mgr.segm_classes[cls_name]['enabled'] = enabled
-                    logger.info(f"Обновлен класс в DetectionManager: {cls_name}={enabled}")
             else:
                 logger.warning(f"Класс сегментации {cls_name} не найден в словаре")
 
-        # Обновляем текущую страницу
-        if self.viewer.cur_page is not None:
-            for mask in self.viewer.masks.get(self.viewer.cur_page, []):
-                if hasattr(mask, 'class_name') and hasattr(mask, 'mask_type'):
-                    classes_dict = self.detect_cls if mask.mask_type == 'detect' else self.segm_cls
-                    if mask.class_name in classes_dict:
-                        mask.setVisible(classes_dict[mask.class_name]['enabled'])
+                # Обновляем текущую страницу
+            if self.viewer.cur_page is not None:
+                for mask in self.viewer.masks.get(self.viewer.cur_page, []):
+                    if hasattr(mask, 'class_name') and hasattr(mask, 'mask_type'):
+                        classes_dict = self.detect_cls if mask.mask_type == 'detect' else self.segm_cls
+                        if mask.class_name in classes_dict:
+                            mask.setVisible(classes_dict[mask.class_name]['enabled'])
 
-            # Обновляем отображение
-            self.viewer.display_current_page()
+                # Обновляем отображение
+                self.viewer.display_current_page()
 
     def reset_to_orig(self):
-        """Сброс изображения к оригиналу"""
-        # Выбор страниц
+        """Сброс изображения к исходному оригиналу с диска как при первом запуске"""
+        # Диалог выбора источника
+        sources = {}
+
+        # Предобработка/Save
+        save_folder = os.path.join(self.chapter_paths["enhanced_folder"], "Save")
+        if os.path.exists(save_folder):
+            save_images = self._get_imgs_from_folder(save_folder)
+            if save_images:
+                sources["preprocess_save"] = {
+                    "images": save_images,
+                    "name": "Предобработка (Save)"
+                }
+
+        # Загрузка
+        upload_images = self._get_imgs_from_folder(self.chapter_paths["upload_folder"])
+        if upload_images:
+            sources["upload"] = {
+                "images": upload_images,
+                "name": "Загрузка"
+            }
+
+        if not sources:
+            QMessageBox.warning(self, "Предупреждение", "Не найдены оригинальные изображения")
+            return
+
+        # Показываем диалог выбора
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QRadioButton, QPushButton, QButtonGroup, QHBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Выбор источника для сброса")
+        dialog.setModal(True)
+        dialog.setFixedWidth(400)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        label = QLabel("Выберите источник для сброса изображений:")
+        label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(label)
+
+        button_group = QButtonGroup()
+
+        for key, source_info in sources.items():
+            radio = QRadioButton(f"{source_info['name']} ({len(source_info['images'])} изображений)")
+            radio.setStyleSheet("margin: 10px 0;")
+            button_group.addButton(radio)
+            radio.toggled.connect(lambda checked, k=key: setattr(dialog, 'selected_source', k if checked else None))
+            layout.addWidget(radio)
+
+            # Выбираем первый по умолчанию
+            if not hasattr(dialog, 'selected_source'):
+                radio.setChecked(True)
+                dialog.selected_source = key
+
+        # Кнопки
+        button_layout = QHBoxLayout()
+
+        ok_btn = QPushButton("OK")
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7E1E9F;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #9E3EAF;
+            }
+        """)
+        ok_btn.clicked.connect(dialog.accept)
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #777;
+            }
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(ok_btn)
+
+        layout.addLayout(button_layout)
+
+        if dialog.exec() != QDialog.Accepted or not hasattr(dialog, 'selected_source'):
+            return
+
+        # Получаем выбранные изображения
+        source_images = sources[dialog.selected_source]["images"]
+
+        # Определение страниц для обработки
         if self.mass_process_cb and self.mass_process_cb.isChecked():
             pages_to_reset = list(range(len(self.img_paths)))
         else:
             pages_to_reset = [self.viewer.cur_page]
 
-        if not pages_to_reset:
-            QMessageBox.information(self, "Информация", "Нет страниц для сброса.")
-            return
-
-        # Запоминаем трансформацию
+        # Сохранение трансформации
         current_transform = self.viewer.transform()
 
+        reset_count = 0
         try:
             for page_idx in pages_to_reset:
-                if page_idx in self.viewer.orig_pixmaps:
-                    # Копируем оригинал
-                    orig_pixmap = self.viewer.orig_pixmaps[page_idx].copy()
-                    self.viewer.pixmaps[page_idx] = orig_pixmap
+                # Проверка границ массива
+                if page_idx < 0 or page_idx >= len(self.img_paths):
+                    logger.error(f"Недопустимый индекс страницы: {page_idx}")
+                    continue
 
-                    # Буфер истории
-                    if page_idx not in self.circ_buf:
-                        self.circ_buf[page_idx] = {
-                            0: None,
-                            1: orig_pixmap.copy(),  # Оригинал
-                            2: None,
-                            3: None
-                        }
-                    else:
-                        # Сброс буфера
-                        self.circ_buf[page_idx][2] = None
+                # Берем соответствующий файл из выбранного источника
+                if page_idx < len(source_images):
+                    orig_path = source_images[page_idx]
+                else:
+                    # Если индекс выходит за границы, пытаемся найти по имени
+                    current_filename = os.path.basename(self.img_paths[page_idx])
+                    base_name = os.path.splitext(current_filename)[0]
+
+                    # Ищем файл с похожим именем
+                    orig_path = None
+                    for src_path in source_images:
+                        src_filename = os.path.basename(src_path)
+                        src_base = os.path.splitext(src_filename)[0]
+                        if src_base == base_name:
+                            orig_path = src_path
+                            break
+
+                    if not orig_path:
+                        logger.warning(f"Не найден оригинал для страницы {page_idx}")
+                        continue
+
+                # Загружаем оригинал с диска
+                if os.path.exists(orig_path):
+                    orig_pixmap = QPixmap(orig_path)
+
+                    if not orig_pixmap.isNull():
+                        # Создаем копию для установки
+                        restored_pixmap = QPixmap(orig_pixmap)
+
+                        # Устанавливаем как текущее изображение
+                        self.viewer.pixmaps[page_idx] = restored_pixmap
+
+                        # ВАЖНО: Удаляем старый слой рисования
+                        if page_idx in self.viewer.draw_layers:
+                            if page_idx in self.viewer.draw_items:
+                                self.viewer.scene_.removeItem(self.viewer.draw_items[page_idx])
+                                del self.viewer.draw_items[page_idx]
+                            del self.viewer.draw_layers[page_idx]
+
+                        # Создаем новый слой с правильными размерами
+                        self.viewer._create_drawing_layer(page_idx)
+
+                        # Обновляем также оригинал в viewer если есть
+                        if hasattr(self.viewer, 'orig_pixmaps'):
+                            self.viewer.orig_pixmaps[page_idx] = QPixmap(orig_pixmap)
+
+                        reset_count += 1
+
+                        # Обновляем буфер как при первом запуске
+                        if page_idx not in self.circ_buf:
+                            self.circ_buf[page_idx] = {
+                                0: None,
+                                1: None,
+                                2: None,
+                                3: None
+                            }
+
+                        # Обновляем позиции буфера
+                        self.circ_buf[page_idx][0] = QPixmap(orig_pixmap)  # Сохраняем оригинал
+                        self.circ_buf[page_idx][1] = QPixmap(orig_pixmap)  # Текущее состояние = оригинал
+                        self.circ_buf[page_idx][2] = None  # Очищаем промежуточные
                         self.circ_buf[page_idx][3] = None
 
-                    # Удаление масок
-                    if page_idx in self.viewer.masks:
-                        for mask in self.viewer.masks[page_idx]:
-                            self.viewer.scene_.removeItem(mask)
-                        self.viewer.masks[page_idx] = []
+                        # Удаление ВСЕХ масок
+                        if page_idx in self.viewer.masks:
+                            for mask in self.viewer.masks[page_idx]:
+                                mask.deleted = True
+                                if mask.scene():
+                                    self.viewer.scene_.removeItem(mask)
+                            self.viewer.masks[page_idx] = []
 
-                    # Очистка слоя рисования
-                    if page_idx in self.viewer.draw_layers:
-                        self.viewer.draw_layers[page_idx].fill(Qt.transparent)
-                        if page_idx in self.viewer.draw_items:
-                            self.viewer.draw_items[page_idx].setPixmap(self.viewer.draw_layers[page_idx])
+                        # Принудительная очистка сцены от ВСЕХ масок (включая обработанные)
+                        items_to_remove = []
+                        for item in self.viewer.scene_.items():
+                            if isinstance(item, (EditableMask, EditablePolygonMask, BrushStroke)):
+                                # Удаляем независимо от статуса processed
+                                items_to_remove.append(item)
 
-                    # Удаление маски
-                    self.comb_masks.pop(page_idx, None)
+                        for item in items_to_remove:
+                            # Удаляем из сцены
+                            if item.scene():
+                                self.viewer.scene_.removeItem(item)
 
-                    # Обновление статуса
-                    self.img_status[page_idx] = 'saved'
+                            # Удаляем из всех массивов масок
+                            for p_idx in self.viewer.masks:
+                                if item in self.viewer.masks[p_idx]:
+                                    self.viewer.masks[p_idx].remove(item)
 
-                    # Обновление миниатюры
-                    if 0 <= page_idx < len(self.thumb_labels):
-                        tw, th = THUMB_W, THUMB_H
-                        scaled_pixmap = orig_pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        self.thumb_labels[page_idx].setPixmap(scaled_pixmap)
-                        self.update_thumb_status(page_idx)
+                        # Дополнительная очистка для текущей страницы
+                        if page_idx == self.viewer.cur_page:
+                            # Еще раз проходим по items сцены
+                            for item in list(self.viewer.scene_.items()):
+                                if isinstance(item, (EditableMask, EditablePolygonMask, BrushStroke)):
+                                    self.viewer.scene_.removeItem(item)
 
-            # Обновление отображения
-            old_fit_to_view = self.viewer.fit_to_view
-            self.viewer.fit_to_view = False
+                        # Очистка комбинированной маски
+                        if page_idx in self.comb_masks:
+                            del self.comb_masks[page_idx]
+
+                        # Принудительное обновление сцены
+                        self.viewer.scene_.update()
+
+                        # Обновление статуса
+                        self.img_status[page_idx] = 'saved'
+
+                        # Обновление миниатюры
+                        if 0 <= page_idx < len(self.thumb_labels):
+                            tw = THUMB_W
+                            th = tw * 2
+                            scaled = restored_pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            self.thumb_labels[page_idx].setPixmap(scaled)
+                            self.upd_thumb_status(page_idx)
+                    else:
+                        logger.error(f"Не удалось загрузить изображение: {orig_path}")
+                else:
+                    logger.error(f"Файл не существует: {orig_path}")
+
+            # Принудительное обновление интерфейса
             self.viewer.display_current_page()
-
-            # Восстановление масштаба
             self.viewer.setTransform(current_transform)
-            self.viewer.fit_to_view = old_fit_to_view
+            QApplication.processEvents()
 
-            # Уведомление
-            if len(pages_to_reset) == 1:
-                QMessageBox.information(self, "Успех", "Изображение сброшено до оригинала.")
+            # Вывод сообщения о результате
+            if reset_count > 0:
+                QMessageBox.information(self, "Успех",
+                                        f"{'Изображение сброшено' if reset_count == 1 else f'{reset_count} изображений сброшено'} до оригинала.")
             else:
-                QMessageBox.information(self, "Успех", f"Сброшено {len(pages_to_reset)} изображений до оригинала.")
+                QMessageBox.warning(self, "Предупреждение",
+                                    "Не удалось найти оригинальные изображения.")
 
         except Exception as e:
             logger.error(f"Ошибка при сбросе до оригинала: {str(e)}")
@@ -2697,207 +2736,183 @@ class CleaningWindow(QWidget):
             logger.error(traceback.format_exc())
             QMessageBox.critical(self, "Ошибка", f"Не удалось сбросить изображения: {str(e)}")
 
+    def sync_detection_manager(self):
+        """Синхронизирует состояние классов с менеджером детекции"""
+        if hasattr(self, 'detect_mgr'):
+            # Синхронизация классов детекции
+            self.detect_mgr.detect_classes = self.detect_cls.copy()
+            # Синхронизация классов сегментации
+            self.detect_mgr.segm_classes = self.segm_cls.copy()
+            logger.info(f"Синхронизированы классы детекции: {self.detect_mgr.detect_classes}")
+            logger.info(f"Синхронизированы классы сегментации: {self.detect_mgr.segm_classes}")
+
     def reset_to_last_saved(self):
         """Сброс изображения к последнему сохраненному состоянию"""
-        # Выбор страниц
-        if self.mass_process_cb and self.mass_process_cb.isChecked():
-            pages_to_reset = list(range(len(self.img_paths)))
-        else:
-            pages_to_reset = [self.viewer.cur_page]
+        pages_to_reset = list(range(len(self.img_paths))) if self.mass_process_cb.isChecked() else [
+            self.viewer.cur_page]
 
-        if not pages_to_reset:
-            QMessageBox.information(self, "Информация", "Нет страниц для сброса.")
-            return
-
-        # Запоминаем трансформацию
         current_transform = self.viewer.transform()
-
         reset_count = 0
+
         try:
             for page_idx in pages_to_reset:
-                if page_idx in self.circ_buf and self.circ_buf[page_idx][1] is not None:
-                    # Восстанавливаем из сохраненного
-                    self.viewer.pixmaps[page_idx] = self.circ_buf[page_idx][1].copy()
-                    reset_count += 1
+                # Загружаем сохраненное изображение из папки клининг
+                saved_path = self.img_paths[page_idx]
+                if os.path.exists(saved_path):
+                    saved_pixmap = QPixmap(saved_path)
 
-                    # Сброс истории
-                    self.circ_buf[page_idx][2] = None
-                    self.circ_buf[page_idx][3] = None
+                    if not saved_pixmap.isNull():
+                        self.viewer.pixmaps[page_idx] = saved_pixmap
+                        reset_count += 1
 
-                    # Удаление масок
-                    if page_idx in self.viewer.masks:
-                        for mask in self.viewer.masks[page_idx]:
-                            self.viewer.scene_.removeItem(mask)
-                        self.viewer.masks[page_idx] = []
+                        # Обновляем буфер
+                        if page_idx not in self.circ_buf:
+                            self.circ_buf[page_idx] = {0: None, 1: None, 2: None, 3: None}
 
-                    # Очистка слоя рисования
-                    if page_idx in self.viewer.draw_layers:
-                        self.viewer.draw_layers[page_idx].fill(Qt.transparent)
-                        if page_idx in self.viewer.draw_items:
-                            self.viewer.draw_items[page_idx].setPixmap(self.viewer.draw_layers[page_idx])
+                        self.circ_buf[page_idx][1] = saved_pixmap.copy()
+                        self.circ_buf[page_idx][2] = None
+                        self.circ_buf[page_idx][3] = None
 
-                    # Удаление маски
-                    self.comb_masks.pop(page_idx, None)
+                        # Очищаем маски и слои
+                        self._clear_all_masks_for_page(page_idx)
 
-                    # Обновление статуса
-                    self.img_status[page_idx] = 'saved'
+                        # Обновляем статус
+                        self.img_status[page_idx] = 'saved'
 
-                    # Обновление миниатюры
-                    if 0 <= page_idx < len(self.thumb_labels):
-                        tw, th = THUMB_W, THUMB_H
-                        scaled_pixmap = self.circ_buf[page_idx][1].scaled(tw, th, Qt.KeepAspectRatio,
-                                                                          Qt.SmoothTransformation)
-                        self.thumb_labels[page_idx].setPixmap(scaled_pixmap)
-                        self.update_thumb_status(page_idx)
+                        # Обновляем миниатюру
+                        if 0 <= page_idx < len(self.thumb_labels):
+                            tw, th = THUMB_W, THUMB_H
+                            scaled = saved_pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            self.thumb_labels[page_idx].setPixmap(scaled)
+                            self.upd_thumb_status(page_idx)
 
-            # Обновление отображения
-            old_fit_to_view = self.viewer.fit_to_view
-            self.viewer.fit_to_view = False
+            # Обновляем отображение
             self.viewer.display_current_page()
-
-            # Восстановление масштаба
             self.viewer.setTransform(current_transform)
-            self.viewer.fit_to_view = old_fit_to_view
 
-            # Уведомление
             if reset_count > 0:
-                if reset_count == 1:
-                    QMessageBox.information(self, "Успех", "Изображение сброшено до последнего сохраненного состояния.")
-                else:
-                    QMessageBox.information(self, "Успех",
-                                            f"Сброшено {reset_count} изображений до последнего сохраненного состояния.")
-            else:
-                QMessageBox.information(self, "Информация", "Нет сохраненных состояний для сброса.")
+                QMessageBox.information(self, "Успех",
+                                        f"Сброшено {reset_count} изображений до последнего сохраненного состояния.")
 
         except Exception as e:
-            logger.error(f"Ошибка при сбросе до сохраненного: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Ошибка при сбросе: {str(e)}")
             QMessageBox.critical(self, "Ошибка", f"Не удалось сбросить изображения: {str(e)}")
 
     def save_result(self):
-        """Сохранение результата в папку Клининг и обновление буфера"""
-        # Выбор страниц
-        if self.mass_process_cb and self.mass_process_cb.isChecked():
-            pages_to_save = list(range(len(self.img_paths)))
-        else:
-            pages_to_save = [self.viewer.cur_page]
+        """Сохранение изображений с принудительной заменой"""
+        output_dir = self.chapter_paths["cleaning_folder"]
+        os.makedirs(output_dir, exist_ok=True)
 
-        if not pages_to_save:
-            QMessageBox.information(self, "Информация", "Нет страниц для сохранения.")
-            return
+        # Определение страниц для сохранения
+        pages_to_save = list(range(len(self.img_paths))) if self.mass_process_cb.isChecked() else [self.viewer.cur_page]
 
-        try:
-            output_dir = self.chapter_paths["cleaning_folder"]
-            os.makedirs(output_dir, exist_ok=True)
+        saved_count = 0
 
-            saved_paths = []
+        for page_idx in pages_to_save:
+            # Правильная проверка для списка
+            if page_idx >= len(self.viewer.pixmaps) or self.viewer.pixmaps[page_idx].isNull():
+                continue
 
-            # Создаем список для обновления путей
-            updated_img_paths = self.img_paths.copy()
+            pixmap = self.viewer.pixmaps[page_idx]
 
-            for page_idx in pages_to_save:
-                # Проверка изображения
-                if page_idx not in self.viewer.pixmaps or self.viewer.pixmaps[page_idx].isNull():
-                    continue
+            # Формирование имени файла
+            filename = os.path.basename(self.img_paths[page_idx])
+            save_path = os.path.join(output_dir, filename)
 
-                # Копия изображения
-                clean_pixmap = self.viewer.pixmaps[page_idx].copy()
+            # Сохранение
+            if pixmap.save(save_path, "PNG"):
+                saved_count += 1
+                self.img_paths[page_idx] = save_path
 
-                # Формирование имени
-                image_path = self.img_paths[page_idx]
-                base_name = os.path.basename(image_path)
-
-                # Проверяем, есть ли уже префикс cleaned_
-                if base_name.startswith("cleaned_"):
-                    output_filename = base_name  # Сохраняем с тем же именем
-                else:
-                    output_filename = f"cleaned_{base_name}"
-
-                output_path = os.path.join(output_dir, output_filename)
-
-                # Сохранение
-                try:
-                    clean_pixmap.save(output_path)
-                    logger.info(f"Результат сохранен в: {output_path}")
-                    saved_paths.append(output_path)
-
-                    # Обновляем путь для будущих загрузок
-                    updated_img_paths[page_idx] = output_path
-                except Exception as e:
-                    logger.error(f"Ошибка при сохранении {output_path}: {str(e)}")
-                    continue
-
-                # Сохранение в буфер
+                # Обновляем буфер
                 if page_idx not in self.circ_buf:
-                    self.circ_buf[page_idx] = {
-                        0: None,
-                        1: clean_pixmap.copy(),  # Сохраняем чистое
-                        2: None,  # Сброс истории
-                        3: None  # Сброс истории
-                    }
+                    self.circ_buf[page_idx] = {0: None, 1: pixmap.copy(), 2: None, 3: None}
                 else:
-                    self.circ_buf[page_idx][1] = clean_pixmap.copy()
-                    self.circ_buf[page_idx][2] = None
-                    self.circ_buf[page_idx][3] = None
+                    self.circ_buf[page_idx][1] = pixmap.copy()
 
-                # Удаление масок
+                # Помечаем маски как обработанные
                 if page_idx in self.viewer.masks:
                     for mask in self.viewer.masks[page_idx]:
-                        self.viewer.scene_.removeItem(mask)
-                    self.viewer.masks[page_idx] = []
+                        mask.processed = True
+                        mask.setVisible(False)
 
-                # Очистка слоя
+                # Очистка слоя рисования
                 if page_idx in self.viewer.draw_layers:
                     self.viewer.draw_layers[page_idx].fill(Qt.transparent)
                     if page_idx in self.viewer.draw_items:
                         self.viewer.draw_items[page_idx].setPixmap(self.viewer.draw_layers[page_idx])
 
-                # Удаление маски
-                self.comb_masks.pop(page_idx, None)
-
-                # Обновление статуса
                 self.img_status[page_idx] = 'saved'
+                self.upd_thumb_status(page_idx)
 
-                # Обновляем миниатюру
-                if 0 <= page_idx < len(self.thumb_labels):
-                    try:
-                        tw = THUMB_W
-                        th = tw * 2
-                        scaled = clean_pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        self.thumb_labels[page_idx].setPixmap(scaled)
-                        # Обновляем отображение статуса
-                        self.update_thumb_status(page_idx)
-                    except Exception as e:
-                        logger.error(f"Ошибка обновления миниатюры: {str(e)}")
+        # Обновление конфигурации
+        if saved_count > 0:
+            config_path = os.path.join(output_dir, "saved_images.json")
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump({"paths": self.img_paths}, f, ensure_ascii=False, indent=4)
 
-            # Обновляем пути к изображениям для будущих загрузок
-            self.img_paths = updated_img_paths
+        if saved_count > 0:
+            QMessageBox.information(self, "Успех", f"Сохранено {saved_count} изображений")
 
-            # Сохраняем список путей в файл конфигурации для будущей загрузки
-            config_path = os.path.join(self.chapter_paths["cleaning_folder"], "saved_images.json")
+    def force_save_current(self):
+        """Принудительное сохранение текущего изображения"""
+        page_idx = self.viewer.cur_page
+        if page_idx < 0 or page_idx >= len(self.img_paths):
+            return
+
+        pixmap = self.viewer.pixmaps[page_idx]
+        if pixmap.isNull():
+            return
+
+        output_dir = self.chapter_paths["cleaning_folder"]
+        os.makedirs(output_dir, exist_ok=True)
+
+        save_path = os.path.join(output_dir, f"{page_idx:04d}.png")
+
+        if pixmap.save(save_path, "PNG"):
+            self.img_paths[page_idx] = save_path
+            self.img_status[page_idx] = 'saved'
+            self.upd_thumb_status(page_idx)
+
+            # Обновление конфигурации
+            config_path = os.path.join(output_dir, "saved_images.json")
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump({"paths": self.img_paths}, f, ensure_ascii=False, indent=4)
+
+            QMessageBox.information(self, "Успех", "Изображение сохранено")
+
+    def force_save_result(self):
+        """Принудительное сохранение изображения"""
+        page_idx = self.viewer.cur_page
+        if page_idx < 0 or page_idx >= len(self.viewer.pixmaps):
+            QMessageBox.warning(self, "Ошибка", "Некорректный индекс страницы")
+            return
+
+        pixmap = self.viewer.pixmaps[page_idx]
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Ошибка", "Отсутствует изображение для сохранения")
+            return
+
+        output_dir = self.chapter_paths["cleaning_folder"]
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = int(time.time())
+        output_path = os.path.join(output_dir, f"cleaned_page_{page_idx + 1}_{timestamp}.png")
+
+        # Сохранение изображения
+        temp_img = pixmap.toImage()
+        save_result = temp_img.save(output_path, "PNG")
+
+        if save_result:
+            QMessageBox.information(self, "Успех", f"Изображение сохранено в: {output_path}")
+            self.img_paths[page_idx] = output_path
+            config_path = os.path.join(output_dir, "saved_images.json")
             try:
                 with open(config_path, 'w', encoding='utf-8') as f:
                     json.dump({"paths": self.img_paths}, f, ensure_ascii=False, indent=4)
-                logger.info(f"Пути к изображениям сохранены в {config_path}")
-            except Exception as e:
-                logger.error(f"Ошибка при сохранении путей: {str(e)}")
-
-            # Обновление отображения
-            self.viewer.display_current_page()
-
-            # Уведомление
-            if len(saved_paths) == 1:
-                QMessageBox.information(self, "Успех", f"Результат сохранен в: {saved_paths[0]}")
-            else:
-                QMessageBox.information(self, "Успех",
-                                        f"Сохранено {len(saved_paths)} изображений в папку Клининг")
-
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить результат: {str(e)}")
+            except Exception:
+                pass
+        else:
+            QMessageBox.critical(self, "Ошибка", "Не удалось сохранить изображение")
 
     def on_status_changed(self):
         """Обновление статуса обработки главы"""
@@ -2938,6 +2953,14 @@ class CleaningWindow(QWidget):
         data["status"] = st
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+
+
+    @property
+    def segm_progress(self):
+        """Свойство для совместимости с m8_3_utils.py"""
+        return self.segm_prog
 
     def load_status(self):
         """Загрузка статуса обработки главы"""

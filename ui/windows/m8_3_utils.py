@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # ui/windows/m8_3_utils.py
+# -*- coding: utf-8 -*-
 import cv2
 import numpy as np
 import os
@@ -12,66 +13,62 @@ from PySide6.QtCore import QObject, Signal, QEvent, QRectF, QPointF
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QPolygonF, QColor, QImage
 from ui.windows.m8_1_graphics_items import EditableMask, EditablePolygonMask, BrushStroke
-
+from PIL import Image
 logger = logging.getLogger(__name__)
 
 
-class ImageLoadedEvent(QEvent):
+class ImgLoadEvent(QEvent):
     """Событие загрузки изображения"""
     EventType = QEvent.Type(QEvent.User + 1)
 
-    def __init__(self, index=None):
-        super().__init__(ImageLoadedEvent.EventType)
-        self.index = index
+    def __init__(self, idx=None):
+        super().__init__(ImgLoadEvent.EventType)
+        self.idx = idx
 
 
-class AllImagesLoadedEvent(QEvent):
+class AllImgLoadEvent(QEvent):
     """Событие загрузки всех изображений"""
     EventType = QEvent.Type(QEvent.User + 2)
 
     def __init__(self):
-        super().__init__(AllImagesLoadedEvent.EventType)
+        super().__init__(AllImgLoadEvent.EventType)
 
 
-class ImageLoader(QObject):
+class ImgLoader(QObject):
     """Загрузчик изображений"""
-    image_loaded = Signal(int, QImage, str)
-    loading_progress = Signal(int, int, str)
-    loading_complete = Signal()
-    loading_cancelled = Signal()
+    img_loaded = Signal(int, QImage, str)
+    load_prog = Signal(int, int, str)
+    load_complete = Signal()
+    load_cancelled = Signal()
 
-    def __init__(self, image_paths, thread_pool=None):
+    def __init__(self, img_paths, thread_pool=None):
         super().__init__()
-        self.image_paths = image_paths
+        self.img_paths = img_paths
         self.thread_pool = thread_pool or ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 2))
         self.cancel_loading = False
 
-    def start_loading(self, priority_index=0):
+    def start_loading(self, priority_idx=0):
         """Запуск загрузки изображений"""
-        # Определяем порядок: текущая, соседние, остальные
-        load_order = self._get_load_order(priority_index)
+        load_order = self._get_load_order(priority_idx)
 
         self.loaded_count = 0
-        self.total_count = len(self.image_paths)
-        self.loading_progress.emit(0, self.total_count, "")
+        self.total_count = len(self.img_paths)
+        self.load_prog.emit(0, self.total_count, "")
 
-        # Запускаем загрузку в отдельном потоке
         thread = threading.Thread(target=self._load_thread, args=(load_order,), daemon=True)
         thread.start()
 
-    def _get_load_order(self, priority_index):
+    def _get_load_order(self, priority_idx):
         """Определяет порядок загрузки изображений"""
-        load_order = [priority_index]
+        load_order = [priority_idx]
 
-        # Добавляем соседние
         for offset in range(1, 4):
-            if priority_index + offset < len(self.image_paths):
-                load_order.append(priority_index + offset)
-            if priority_index - offset >= 0:
-                load_order.append(priority_index - offset)
+            if priority_idx + offset < len(self.img_paths):
+                load_order.append(priority_idx + offset)
+            if priority_idx - offset >= 0:
+                load_order.append(priority_idx - offset)
 
-        # Добавляем остальные
-        for i in range(len(self.image_paths)):
+        for i in range(len(self.img_paths)):
             if i not in load_order:
                 load_order.append(i)
 
@@ -83,7 +80,7 @@ class ImageLoader(QObject):
             return None, idx, ""
 
         try:
-            path = self.image_paths[idx]
+            path = self.img_paths[idx]
             current_file = path.split('/')[-1] if '/' in path else path
             image = QImage(path)
 
@@ -106,8 +103,6 @@ class ImageLoader(QObject):
 
                 future = self.thread_pool.submit(self._load_image, idx)
                 futures.append(future)
-
-                # Задержка чтобы не блокировать GUI
                 time.sleep(0.05)
 
             # Обработка результатов
@@ -117,20 +112,20 @@ class ImageLoader(QObject):
 
                 image, idx, current_file = future.result()
                 if image is not None:
-                    self.image_loaded.emit(idx, image, current_file)
+                    self.img_loaded.emit(idx, image, current_file)
                     self.loaded_count += 1
-                    self.loading_progress.emit(self.loaded_count, self.total_count, current_file)
+                    self.load_prog.emit(self.loaded_count, self.total_count, current_file)
 
             # Сигнал о завершении
             if not self.cancel_loading:
-                self.loading_complete.emit()
-                QApplication.postEvent(QApplication.instance().activeWindow(), AllImagesLoadedEvent())
+                self.load_complete.emit()
+                QApplication.postEvent(QApplication.instance().activeWindow(), AllImgLoadEvent())
             else:
-                self.loading_cancelled.emit()
+                self.load_cancelled.emit()
 
         except Exception as e:
             logger.error(f"Ошибка загрузки: {str(e)}")
-            self.loading_cancelled.emit()
+            self.load_cancelled.emit()
 
     def cancel(self):
         """Отмена загрузки"""
@@ -168,18 +163,16 @@ class DetectionManager(QObject):
     def __init__(self, ai_models, detect_classes, segm_classes):
         super().__init__()
         self.ai_models = ai_models
-        # Создаем новые словари, чтобы избежать проблем с ссылками
         self.detect_classes = detect_classes
         self.segm_classes = segm_classes
         self.detection_model = None
         self.segmentation_model = None
+        self.viewer = None
         enable_cuda_cudnn()
 
-        # Выводим состояние для отладки
-        logger.info("=== DetectionManager инициализирован с классами ===")
-        for cls, info in self.detect_classes.items():
-            logger.info(f"- {cls}: enabled={info['enabled']}, threshold={info['threshold']}")
-
+    def set_viewer(self, viewer):
+        self.viewer = viewer
+        logger.debug("Установлен viewer для DetectionManager")
     def load_detection_model(self):
         """Загружает модель детекции"""
         if self.detection_model is not None:
@@ -204,11 +197,11 @@ class DetectionManager(QObject):
             logger.error(f"Ошибка загрузки модели детекции: {str(e)}")
             return None
 
-    def _gen_color_for(self, name):
-        # пример генерации цвета по имени
+    def _gen_color(self, name):
+        """Генерирует цвет по имени"""
         import random
         random.seed(hash(name))
-        return tuple(random.randint(0,255) for _ in range(3))
+        return tuple(random.randint(0, 255) for _ in range(3))
 
     def load_segmentation_model(self):
         """Загружает модель сегментации"""
@@ -234,51 +227,88 @@ class DetectionManager(QObject):
             logger.error(f"Ошибка загрузки модели сегментации: {str(e)}")
             return None
 
-    def detect_page(self, image_path, page_idx, expansion=10):
-        """Выполняет детекцию объектов на странице"""
+    def detect_page(self, img_path, page_idx, expansion=10):
         try:
-            if not os.path.exists(image_path):
-                logger.warning(f"Файл не существует: {image_path}")
-                return None
-
             model = self.load_detection_model()
             if model is None:
                 return None
 
             device = get_device()
-            logger.info(f"Детекция страницы {page_idx + 1} на {device}")
 
-            # Запускаем детекцию и получаем результаты в формате YOLO
-            results = model(image_path, conf=0.25, device=device)
+            if self.viewer and page_idx in self.viewer.pixmaps and not self.viewer.pixmaps[page_idx].isNull():
+                pixmap = self.viewer.pixmaps[page_idx]
+                logger.debug(f"Используем pixmap из памяти для страницы {page_idx}")
+
+                qimg = pixmap.toImage()
+                qimg = qimg.convertToFormat(QImage.Format_RGB888)
+
+                width = qimg.width()
+                height = qimg.height()
+
+                ptr = qimg.bits()
+                ptr.setsize(height * width * 3)
+                arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 3))
+
+                img_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+                logger.info(f"Детекция страницы {page_idx + 1} на {device} (из памяти)")
+                results = model(img_bgr, conf=0.25, device=device)
+            else:
+                if not os.path.exists(img_path):
+                    logger.warning(f"Файл не существует: {img_path}")
+                    return None
+
+                logger.info(f"Детекция страницы {page_idx + 1} на {device} (из файла)")
+                results = model(img_path, conf=0.25, device=device)
+
             logger.info(f"Детекция завершена для страницы {page_idx + 1}")
 
-            # Очистка памяти
             if device == 'cuda':
                 torch.cuda.empty_cache()
 
             return results
         except Exception as e:
             logger.error(f"Ошибка детекции страницы {page_idx}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
-    def segment_page(self, image_path, page_idx, expansion=10):
-        """Выполняет сегментацию объектов на странице"""
+    def segment_page(self, img_path, page_idx, expansion=10):
         try:
-            if not os.path.exists(image_path):
-                logger.warning(f"Файл не существует: {image_path}")
-                return None
-
             model = self.load_segmentation_model()
             if model is None:
                 return None
 
             device = get_device()
-            logger.info(f"Сегментация страницы {page_idx + 1} на {device}")
 
-            results = model(image_path, conf=0.25, device=device)
+            if self.viewer and page_idx in self.viewer.pixmaps and not self.viewer.pixmaps[page_idx].isNull():
+                pixmap = self.viewer.pixmaps[page_idx]
+                logger.debug(f"Используем pixmap из памяти для страницы {page_idx}")
+
+                qimg = pixmap.toImage()
+                qimg = qimg.convertToFormat(QImage.Format_RGB888)
+
+                width = qimg.width()
+                height = qimg.height()
+
+                ptr = qimg.bits()
+                ptr.setsize(height * width * 3)
+                arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 3))
+
+                img_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+                logger.info(f"Сегментация страницы {page_idx + 1} на {device} (из памяти)")
+                results = model(img_bgr, conf=0.25, device=device)
+            else:
+                if not os.path.exists(img_path):
+                    logger.warning(f"Файл не существует: {img_path}")
+                    return None
+
+                logger.info(f"Сегментация страницы {page_idx + 1} на {device} (из файла)")
+                results = model(img_path, conf=0.25, device=device)
+
             logger.info(f"Сегментация завершена для страницы {page_idx + 1}")
 
-            # Очистка памяти
             if device == 'cuda':
                 torch.cuda.empty_cache()
 
@@ -287,17 +317,17 @@ class DetectionManager(QObject):
             logger.error(f"Ошибка сегментации страницы {page_idx}: {str(e)}")
             return None
 
-    def detect_area(self, image_path, page_idx, selection_rect, expansion=10):
+    def detect_area(self, img_path, page_idx, sel_rect, expansion=10):
         """Выполняет детекцию объектов в выбранной области"""
         try:
-            img = cv2.imread(image_path)
+            img = cv2.imread(img_path)
             if img is None:
-                logger.warning(f"Не удалось загрузить изображение: {image_path}")
+                logger.warning(f"Не удалось загрузить изображение: {img_path}")
                 return None, (0, 0)
 
             # Координаты выделения
-            x, y = int(selection_rect.x()), int(selection_rect.y())
-            w, h = int(selection_rect.width()), int(selection_rect.height())
+            x, y = int(sel_rect.x()), int(sel_rect.y())
+            w, h = int(sel_rect.width()), int(sel_rect.height())
 
             # Проверка границ
             h_img, w_img = img.shape[:2]
@@ -309,10 +339,6 @@ class DetectionManager(QObject):
             # Обрезаем изображение
             roi = img[y:y + h, x:x + w]
 
-            # Сохраняем временный файл
-            temp_path = os.path.join(os.path.dirname(image_path), f"temp_roi_{page_idx}.jpg")
-            cv2.imwrite(temp_path, roi)
-
             model = self.load_detection_model()
             if model is None:
                 return None, (0, 0)
@@ -320,11 +346,8 @@ class DetectionManager(QObject):
             device = get_device()
             logger.info(f"Детекция области на странице {page_idx + 1}")
 
-            results = model(temp_path, conf=0.25, device=device)
-
-            # Удаляем временный файл
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            # Передаем numpy массив напрямую в модель (YOLO поддерживает это)
+            results = model(roi, conf=0.25, device=device)
 
             # Очистка памяти
             if device == 'cuda':
@@ -335,39 +358,41 @@ class DetectionManager(QObject):
             logger.error(f"Ошибка детекции области: {str(e)}")
             return None, (0, 0)
 
-    def _normalize_cls_name(self, cls_name: str) -> str:
-        """
-        Приводит имя класса из модели к одному из четырех классов:
-        Text, Sound, FonText, ComplexText
-        """
-        # Для Bubble всегда возвращаем Sound
-        if cls_name == 'Bubble':
-            return 'Sound'
+    def _norm_cls_name(self, cls_name):
+        """Нормализует имя класса из модели"""
+        # Прямое сопоставление имен классов из модели с внутренними именами
+        mapping = {
+            'Bubble': 'Bubble',
+            'Sound': 'Sound',
+            'Text': 'Text',
+            'Texts': 'Text',
+            'Fon': 'FonText',
+            'FonText': 'FonText',
+            'Watermark': 'FonText',
+            'Segm': 'ComplexText',
+            'ComplexText': 'ComplexText',
+            'Aura': 'ComplexText',
+            'TextSegm': 'TextSegm'  # Для сегментации
+        }
 
-        # Для других имен используем стандартное преобразование
-        if cls_name == 'Text' or cls_name == 'Texts':
-            return 'Text'
-        elif cls_name == 'Sound' or cls_name == 'Sounds':
+        # Возвращаем нормализованное имя или Text по умолчанию
+        normalized = mapping.get(cls_name)
+        if normalized:
+            return normalized
+
+        # Если не найдено в mapping, пробуем по ключевым словам
+        lower_name = cls_name.lower()
+        if'sound' in lower_name:
             return 'Sound'
-        elif cls_name == 'Fon' or cls_name == 'FonText' or cls_name == 'Watermark':
+        elif 'fon' in lower_name:
             return 'FonText'
-        elif cls_name == 'Segm' or cls_name == 'ComplexText' or cls_name == 'Aura':
+        elif 'complex' in lower_name or 'segm' in lower_name or 'aura' in lower_name:
             return 'ComplexText'
         else:
-            # Если неизвестный класс, возвращаем по ключевым словам
-            lower_name = cls_name.lower()
-            if 'bubble' in lower_name:
-                return 'Sound'
-            elif 'fon' in lower_name:
-                return 'FonText'
-            elif 'complex' in lower_name or 'segm' in lower_name:
-                return 'ComplexText'
-            else:
-                return 'Text'  # По умолчанию
+            return 'Text'
 
-    def process_detection_results(self, results, viewer, page_idx, expansion_value=0, img_shape=None, offset=None, scale_factor=1.0):
-
-
+    def process_detection_results(self, results, viewer, page_idx, expansion_value=0, img_shape=None, offset=None,
+                                  scale_factor=1.0):
         """Обработка результатов детекции для отображения в просмотрщике"""
         if page_idx not in viewer.masks:
             viewer.masks[page_idx] = []
@@ -384,7 +409,7 @@ class DetectionManager(QObject):
                 logger.error(f"Не удалось определить размеры изображения для страницы {page_idx}")
                 return
 
-        x_offset, y_offset = offset or (0, 0)
+        x_off, y_off = offset or (0, 0)
 
         # Убираем старые детекционные маски
         existing = []
@@ -401,33 +426,8 @@ class DetectionManager(QObject):
                 boxes = results[0].boxes
                 names = results[0].names
 
-                # Получаем состояние чекбоксов из родительского окна
+                # Получаем состояние классов
                 parent_window = viewer.window()
-                sound_enabled = False
-                complex_enabled = False
-                fontext_enabled = False
-
-                if hasattr(parent_window, 'cb_sound'):
-                    sound_enabled = parent_window.cb_sound.isChecked()
-                    logger.info(f"Состояние чекбокса Sound: {sound_enabled}")
-
-                if hasattr(parent_window, 'cb_complex_text'):
-                    complex_enabled = parent_window.cb_complex_text.isChecked()
-                    logger.info(f"Состояние чекбокса ComplexText: {complex_enabled}")
-
-                if hasattr(parent_window, 'cb_fontext'):
-                    fontext_enabled = parent_window.cb_fontext.isChecked()
-                    logger.info(f"Состояние чекбокса FonText: {fontext_enabled}")
-
-                # Принудительно обновляем состояние в классах
-                self.detect_classes['Sound']['enabled'] = sound_enabled
-                self.detect_classes['ComplexText']['enabled'] = complex_enabled
-                self.detect_classes['FonText']['enabled'] = fontext_enabled
-
-                # Логируем доступные классы для отладки
-                logger.debug(f"Доступные классы в модели: {names}")
-                active_classes = [name for name, info in self.detect_classes.items() if info.get('enabled', False)]
-                logger.debug(f"Активные классы детекции: {active_classes}")
 
                 added = 0
                 class_counts = {}
@@ -437,41 +437,32 @@ class DetectionManager(QObject):
                     raw_name = names.get(cls_id, str(cls_id))
                     conf = float(box.conf.item())
 
-                    # Нормализация имени класса к одному из четырех поддерживаемых
-                    cls_name = self._normalize_cls_name(raw_name)
-                    if cls_name is None:
-                        logger.debug(f"Класс '{raw_name}' не входит в список допустимых классов, пропускаем")
-                        continue
+                    # Нормализация имени класса
+                    cls_name = self._norm_cls_name(raw_name)
+                    logger.debug(f"Обработка: raw_name={raw_name}, normalized={cls_name}, conf={conf}")
 
                     # Получаем информацию о классе
                     cls_info = self.detect_classes.get(cls_name)
                     if cls_info is None:
-                        logger.warning(f"Класс {cls_name} не найден в словаре detect_classes, пропускаем")
+                        logger.warning(f"Класс {cls_name} не найден в словаре detect_classes")
                         continue
 
-                    logger.debug(f"Confidence: {conf}, threshold: {cls_info.get('threshold', 0.5)}")
+                    # Проверка порога уверенности
+                    if conf < cls_info.get('threshold', 0.5):
+                        logger.debug(f"Класс {cls_name}: conf {conf} < threshold {cls_info.get('threshold', 0.5)}")
+                        continue
 
-                    # ПРЯМАЯ ОБРАБОТКА КЛАССА SOUND ПО ЧЕКБОКСУ
-                    if cls_name == 'Sound' and sound_enabled:
-                        # Не проверяем enabled, а напрямую используем состояние чекбокса
-                        pass
-                    elif cls_name == 'ComplexText' and complex_enabled:
-                        # Не проверяем enabled, а напрямую используем состояние чекбокса
-                        pass
-                    elif cls_name == 'FonText' and fontext_enabled:
-                        # Не проверяем enabled, а напрямую используем состояние чекбокса
-                        pass
-                    # Для остальных классов используем стандартную проверку
-                    elif not cls_info.get('enabled', False):
-                        logger.debug(f"Класс {cls_name} отключен, пропускаем")
+                    # Проверка включенности класса
+                    if not cls_info.get('enabled', False):
+                        logger.debug(f"Класс {cls_name} отключен")
                         continue
 
                     # Координаты
                     x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0]
-                    x1 += x_offset
-                    y1 += y_offset
-                    x2 += x_offset
-                    y2 += y_offset
+                    x1 += x_off
+                    y1 += y_off
+                    x2 += x_off
+                    y2 += y_off
 
                     # Расширение маски если указано
                     if expansion_value:
@@ -508,7 +499,6 @@ class DetectionManager(QObject):
                     added += 1
 
                 logger.info(f"Добавлено {added} масок детекции для страницы {page_idx}")
-
                 if class_counts:
                     logger.info(f"Распределение по классам: {class_counts}")
 
@@ -525,71 +515,89 @@ class DetectionManager(QObject):
     def process_segmentation_results(self, results, viewer, page_idx, expansion=10, img_shape=None, offset=(0, 0)):
         """Обрабатывает результаты сегментации и создает маски"""
         if not results or not hasattr(results[0], 'masks') or results[0].masks is None:
+            logger.warning("Нет результатов сегментации")
             return
 
         try:
             masks = results[0].masks
+            names = results[0].names
 
             # Определяем размеры изображения
             if img_shape:
                 h, w = img_shape[:2]
-            elif page_idx in [0, 4, 45]:
-                w, h = 800, 1126
-                if page_idx in viewer.pixmaps and not viewer.pixmaps[page_idx].isNull():
-                    w = viewer.pixmaps[page_idx].width()
-                    h = viewer.pixmaps[page_idx].height()
-                logger.info(f"Используем размеры по умолчанию для проблемной страницы {page_idx}: {w}x{h}")
             elif page_idx in viewer.pixmaps and not viewer.pixmaps[page_idx].isNull():
                 h, w = viewer.pixmaps[page_idx].height(), viewer.pixmaps[page_idx].width()
             else:
                 h, w = 1000, 1000
-                logger.warning(f"Используем стандартные размеры 1000x1000 для страницы {page_idx}")
+                logger.warning(f"Используем стандартные размеры для страницы {page_idx}")
 
             if page_idx not in viewer.masks:
                 viewer.masks[page_idx] = []
 
-            active_classes = [cls for cls, info in self.segm_classes.items() if info['enabled']]
-            masks_added = False
+            masks_added = 0
+            class_counts = {}
 
             for i in range(len(masks)):
                 segment = masks.xy[i]
                 cls_id = int(results[0].boxes[i].cls.item())
                 conf = float(results[0].boxes[i].conf.item())
-                cls_name = results[0].names[cls_id]
+                raw_name = names.get(cls_id, str(cls_id))
 
-                if cls_name in self.segm_classes and cls_name in active_classes:
-                    if conf < self.segm_classes[cls_name]['threshold']:
-                        continue
+                # Нормализация имени класса для сегментации
+                cls_name = self._norm_cls_name(raw_name)
 
-                    if expansion > 0:
-                        segment = self._expand_polygon(segment, expansion)
+                # Проверка класса в словаре сегментации
+                if cls_name not in self.segm_classes:
+                    logger.debug(f"Класс {cls_name} не найден в segm_classes")
+                    continue
 
-                    # Смещение точек
-                    offset_segment = [[
-                        max(0, min(x+offset[0], w-1)),
-                        max(0, min(y+offset[1], h-1))
-                    ] for x, y in segment]
+                cls_info = self.segm_classes[cls_name]
 
-                    if len(offset_segment) < 3:
-                        continue
+                # Проверка включенности
+                if not cls_info.get('enabled', False):
+                    logger.debug(f"Класс {cls_name} отключен для сегментации")
+                    continue
 
-                    color = self.segm_classes[cls_name]['color']
-                    poly_mask = EditablePolygonMask(offset_segment, 'segm', cls_name, conf, color)
-                    poly_mask.last_expansion = expansion
-                    poly_mask.set_page_index(page_idx)
+                # Проверка порога
+                if conf < cls_info.get('threshold', 0.5):
+                    logger.debug(f"Низкая уверенность для {cls_name}: {conf}")
+                    continue
 
-                    viewer.scene_.addItem(poly_mask)
-                    viewer.masks[page_idx].append(poly_mask)
-                    poly_mask.setVisible(viewer.cur_page == page_idx)
-                    poly_mask.setZValue(100)
-                    masks_added = True
+                if expansion > 0:
+                    segment = self._expand_polygon(segment, expansion)
 
-            if masks_added:
+                # Смещение точек
+                offset_segment = [[
+                    max(0, min(x + offset[0], w - 1)),
+                    max(0, min(y + offset[1], h - 1))
+                ] for x, y in segment]
+
+                if len(offset_segment) < 3:
+                    continue
+
+                color = cls_info.get('color', (255, 255, 0))
+                poly_mask = EditablePolygonMask(offset_segment, 'segm', cls_name, conf, color)
+                poly_mask.last_expansion = expansion
+                poly_mask.set_page_index(page_idx)
+
+                viewer.scene_.addItem(poly_mask)
+                viewer.masks[page_idx].append(poly_mask)
+                poly_mask.setVisible(viewer.cur_page == page_idx)
+                poly_mask.setZValue(100)
+
+                masks_added += 1
+                class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+
+            logger.info(f"Добавлено {masks_added} масок сегментации для страницы {page_idx}")
+            if class_counts:
+                logger.info(f"Распределение по классам: {class_counts}")
+
+            if masks_added > 0:
                 window = viewer.window()
-                if hasattr(window, 'update_combined_mask_from_visual'):
-                    window.update_combined_mask_from_visual(page_idx)
-                if hasattr(window, 'force_update_thumbnail'):
-                    window.force_update_thumbnail(page_idx)
+                if hasattr(window, 'upd_comb_mask_from_visual'):
+                    window.upd_comb_mask_from_visual(page_idx)
+                if hasattr(window, 'force_upd_thumb'):
+                    window.force_upd_thumb(page_idx)
                 viewer.mask_updated.emit(page_idx)
 
         except Exception as e:
@@ -703,33 +711,46 @@ class DetectionManager(QObject):
             import traceback
             logger.error(traceback.format_exc())
 
-    # В классе DetectionManager:
     def process_detection_pages(self, window, pages_to_process, expansion_value):
         """Последовательная обработка страниц для детекции"""
         from PySide6.QtCore import QTimer
-
-        # Постоянное значение вместо зависимости от атрибута окна
         PROGRESS_AUTO_HIDE_MS = 5000
 
-        if window.detection_cancelled:
-            window._restore_detect_button()
-            window._update_progress_bar_immediate(window.detect_progress, 0, 1, "Детекция отменена")
-            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, lambda: window.detect_progress.setVisible(False))
-            window.unlock_interface()
+        if window.det_canc:
+            window._restore_detect_btn()
+            window._upd_prog_bar(window.detect_prog, 0, 1, "Детекция отменена")
+
+            def hide_progress():
+                if hasattr(window, 'detect_prog') and window.detect_prog:
+                    try:
+                        window.detect_prog.setVisible(False)
+                    except RuntimeError:
+                        pass
+
+            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, hide_progress)
+            window.unlock_ui()
             return
 
         if window.current_page_index >= window.total_pages:
             # Завершаем обработку
-            window._update_progress_bar_immediate(
-                window.detect_progress, window.total_pages, window.total_pages, "Детекция завершена")
+            window._upd_prog_bar(
+                window.detect_prog, window.total_pages, window.total_pages, "Детекция завершена")
 
             # Обновляем отображение
             window.viewer.display_current_page()
 
             # Восстанавливаем интерфейс
-            window._restore_detect_button()
-            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, lambda: window.detect_progress.setVisible(False))
-            window.unlock_interface()
+            window._restore_detect_btn()
+
+            def hide_progress():
+                if hasattr(window, 'detect_prog') and window.detect_prog:
+                    try:
+                        window.detect_prog.setVisible(False)
+                    except RuntimeError:
+                        pass
+
+            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, hide_progress)
+            window.unlock_ui()
             return
 
         # Текущий индекс страницы для обработки
@@ -742,15 +763,15 @@ class DetectionManager(QObject):
             progress_msg = f"Детекция страницы {page_idx + 1} ({window.current_page_index + 1}/{window.total_pages})"
 
         # Обновляем прогресс
-        window._update_progress_bar_immediate(
-            window.detect_progress, window.current_page_index, window.total_pages, progress_msg)
+        window._upd_prog_bar(
+            window.detect_prog, window.current_page_index, window.total_pages, progress_msg)
 
         try:
             # Очищаем существующие маски
             window._clear_page_masks(page_idx, 'detect')
 
             # Получаем путь к изображению
-            image_path = window.image_paths[page_idx]
+            image_path = window.img_paths[page_idx]
 
             # Запускаем детекцию
             results = self.detect_page(image_path, page_idx, expansion_value)
@@ -776,29 +797,27 @@ class DetectionManager(QObject):
     def process_segmentation_pages(self, window, pages_to_process, expansion_value):
         """Последовательная обработка страниц для сегментации"""
         from PySide6.QtCore import QTimer
-
-        # Постоянное значение вместо зависимости от атрибута окна
         PROGRESS_AUTO_HIDE_MS = 5000
 
-        if window.segmentation_cancelled:
-            window._restore_segm_button()
-            window._update_progress_bar_immediate(window.segm_progress, 0, 1, "Сегментация отменена")
-            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, lambda: window.segm_progress.setVisible(False))
-            window.unlock_interface()
+        if window.segm_canc:
+            window._restore_segm_btn()
+            window._upd_prog_bar(window.segm_prog, 0, 1, "Сегментация отменена")
+            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, lambda: window.segm_prog.setVisible(False))
+            window.unlock_ui()
             return
 
         if window.segm_current_page_index >= window.segm_total_pages:
             # Завершаем обработку
-            window._update_progress_bar_immediate(
-                window.segm_progress, window.segm_total_pages, window.segm_total_pages, "Сегментация завершена")
+            window._upd_prog_bar(
+                window.segm_prog, window.segm_total_pages, window.segm_total_pages, "Сегментация завершена")
 
             # Обновляем отображение
             window.viewer.display_current_page()
 
             # Восстанавливаем интерфейс
-            window._restore_segm_button()
-            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, lambda: window.segm_progress.setVisible(False))
-            window.unlock_interface()
+            window._restore_segm_btn()
+            QTimer.singleShot(PROGRESS_AUTO_HIDE_MS, lambda: window.segm_prog.setVisible(False))
+            window.unlock_ui()
             return
 
         # Текущий индекс страницы для обработки
@@ -811,15 +830,15 @@ class DetectionManager(QObject):
             progress_msg = f"Сегментация страницы {page_idx + 1} ({window.segm_current_page_index + 1}/{window.segm_total_pages})"
 
         # Обновляем прогресс
-        window._update_progress_bar_immediate(
-            window.segm_progress, window.segm_current_page_index, window.segm_total_pages, progress_msg)
+        window._upd_prog_bar(
+            window.segm_prog, window.segm_current_page_index, window.segm_total_pages, progress_msg)
 
         try:
             # Очищаем существующие маски
             window._clear_page_masks(page_idx, 'segm')
 
             # Получаем путь к изображению
-            image_path = window.image_paths[page_idx]
+            image_path = window.img_paths[page_idx]
 
             # Запускаем сегментацию
             results = self.segment_page(image_path, page_idx, expansion_value)
@@ -830,7 +849,7 @@ class DetectionManager(QObject):
                     results, window.viewer, page_idx, expansion_value)
 
                 # Обновляем миниатюру
-                window.update_combined_mask_from_visual(page_idx)
+                window.upd_comb_mask_from_visual(page_idx)
 
             # Увеличиваем индекс и планируем следующий шаг
             window.segm_current_page_index += 1

@@ -291,11 +291,13 @@ class CustomImageViewer(QGraphicsView):
                     count += 1
             logger.debug(f"Отображаем {count} масок для страницы {self.cur_page}")
 
-        if self.fit_to_view:
+        # ИЗМЕНЕНО: логика масштабирования
+        if self.fit_to_view and not hasattr(self, '_initial_fit_done'):
             self.resetTransform()
             self.scale_factor = 1.0
             self.fitInView(self.single_page_item, Qt.KeepAspectRatio)
-        else:
+            self._initial_fit_done = True
+        elif not self.fit_to_view:
             QTimer.singleShot(50, lambda: self.setTransform(old_transform))
             self.scale_factor = old_scale_factor
 
@@ -371,32 +373,35 @@ class CustomImageViewer(QGraphicsView):
         self.last_pt = None
 
     def clear_all_masks(self):
-        """Удаляет все маски на текущей странице"""
+        logger.debug(f"Удаление всех масок на странице {self.cur_page}")
+
         if self.cur_page in self.masks:
+            mask_count = len(self.masks[self.cur_page])
             for mask in self.masks[self.cur_page]:
-                self.scene_.removeItem(mask)
+                if mask.scene():
+                    self.scene_.removeItem(mask)
             self.masks[self.cur_page] = []
+            logger.debug(f"Удалено {mask_count} масок")
 
-            # Очищаем слой рисования
-            if self.cur_page in self.draw_layers:
-                self.draw_layers[self.cur_page].fill(Qt.transparent)
-                if self.cur_page in self.draw_items:
-                    self.draw_items[self.cur_page].setPixmap(self.draw_layers[self.cur_page])
+        if self.cur_page in self.draw_layers:
+            self.draw_layers[self.cur_page].fill(Qt.transparent)
+            if self.cur_page in self.draw_items:
+                self.draw_items[self.cur_page].setPixmap(self.draw_layers[self.cur_page])
+            logger.debug("Очищен слой рисования")
 
-            # Обновляем отображение
-            self.viewport().update()
+        self.viewport().update()
+        self.mask_updated.emit(self.cur_page)
 
-            # Отправляем сигнал обновления
-            self.mask_updated.emit(self.cur_page)
+        window = self.window()
+        if hasattr(window, 'upd_comb_mask'):
+            window.upd_comb_mask(self.cur_page)
+        if hasattr(window, 'upd_thumb_status'):
+            window.upd_thumb_status(self.cur_page)
 
-            # Уведомляем родительское окно
-            window = self.window()
-            if hasattr(window, 'update_combined_mask_from_visual'):
-                window.update_combined_mask_from_visual(self.cur_page)
+        self.drawing = False
+        self.last_pt = None
 
-            # Сбрасываем состояние рисования
-            self.drawing = False
-            self.last_pt = None
+        logger.debug("Завершено удаление масок")
 
     def _cleanup_graphics_artifacts(self):
         """Очистка артефактов графики после операций с масками"""
@@ -460,18 +465,14 @@ class CustomImageViewer(QGraphicsView):
             self.viewport().update()
 
     def mousePressEvent(self, event):
-        """Нажатие мыши - начало рисования или взаимодействия"""
-        # Для режима просмотра используем стандартное поведение
         if self.draw_mode == DrawingMode.NONE:
             super().mousePressEvent(event)
             return
 
-        # Правая кнопка для временного переключения на ластик
         if event.button() == Qt.RightButton and self.draw_mode == DrawingMode.BRUSH:
             self.saved_draw_mode = self.draw_mode
             self.set_draw_mode(DrawingMode.ERASER)
 
-            # Создаем новое событие с левой кнопкой
             new_position = event.position()
             new_buttons = event.buttons() & ~Qt.RightButton | Qt.LeftButton
             new_event = type(event)(
@@ -484,114 +485,94 @@ class CustomImageViewer(QGraphicsView):
             self.mousePressEvent(new_event)
             return
 
-        # Для режима рисования
         if event.button() == Qt.LeftButton:
-            # Получаем координаты в системе сцены
             scene_pos = self.mapToScene(event.position().toPoint())
             page_idx = self.cur_page
 
-            # Проверяем и создаем слой для рисования
             if page_idx not in self.draw_layers:
                 if not self._create_drawing_layer(page_idx):
                     logger.error(f"Не удалось создать слой для страницы {page_idx}")
                     return
 
-            # Начинаем рисование
             self.drawing = True
             self.last_pt = scene_pos
 
-            # Рисуем первую точку
             is_eraser = (self.draw_mode == DrawingMode.ERASER)
             success = self._draw_stroke(page_idx, scene_pos, None, is_eraser)
             if not success:
                 self.drawing = False
                 self.last_pt = None
 
-    # Добавить в файл m8_2_image_viewer.py
-
     def mouseMoveEvent(self, event):
-        """Движение мыши - продолжение рисования или взаимодействия"""
-        # Для режима просмотра или если не рисуем
         if self.draw_mode == DrawingMode.NONE or not self.drawing:
             super().mouseMoveEvent(event)
             return
 
-        # Проверка начальной точки
         if self.last_pt is None:
             return
 
-        # Получаем координаты в системе сцены
         scene_pos = self.mapToScene(event.position().toPoint())
 
-        # Проверяем, что точка не совпадает с предыдущей (избегаем лишних обновлений)
         if (abs(scene_pos.x() - self.last_pt.x()) < 1 and
                 abs(scene_pos.y() - self.last_pt.y()) < 1):
             return
 
-        # Определяем режим (кисть/ластик)
         is_eraser = (self.draw_mode == DrawingMode.ERASER)
-
-        # Рисуем линию от предыдущей точки к текущей
         success = self._draw_stroke(self.cur_page, self.last_pt, scene_pos, is_eraser)
 
-        # Запоминаем новую точку ТОЛЬКО если успешно нарисовали
         if success:
             self.last_pt = scene_pos
 
-            # Обновляем окно и миниатюру
             window = self.window()
             if hasattr(window, 'force_update_thumbnail'):
-                # Делаем обновление миниатюры не каждый раз, а периодически
                 if not hasattr(self, 'thumbnail_update_timer'):
                     self.thumbnail_update_timer = QTimer()
                     self.thumbnail_update_timer.setSingleShot(True)
                     self.thumbnail_update_timer.timeout.connect(
                         lambda: window.force_update_thumbnail(self.cur_page))
 
-                # Если таймер не активен, запускаем его
                 if not self.thumbnail_update_timer.isActive():
-                    self.thumbnail_update_timer.start(200)  # Обновляем не чаще чем раз в 200 мс
+                    self.thumbnail_update_timer.start(200)
 
-                # Устанавливаем статус "modified"
                 if hasattr(window, 'image_status'):
                     window.image_status[self.cur_page] = 'modified'
 
-        # Обновляем представление
         self.viewport().update()
 
     def mouseReleaseEvent(self, event):
-        """Отпускание кнопки мыши - завершение рисования или взаимодействия"""
-        # Возвращаемся к кисти, если использовали ластик с правой кнопкой
         if event.button() == Qt.RightButton and hasattr(self, 'saved_draw_mode'):
             self.set_draw_mode(self.saved_draw_mode)
             delattr(self, 'saved_draw_mode')
             return
 
-        # Для режима просмотра или если не рисуем
-        if self.draw_mode == DrawingMode.NONE or not self.drawing:
+        if self.draw_mode == DrawingMode.NONE:
             super().mouseReleaseEvent(event)
             return
 
-        # ВАЖНО: НЕ рисуем заключительную линию до точки отпускания мыши
-        # Просто заканчиваем рисование на последней обработанной точке
-
-        # Финальное обновление миниатюры для завершения рисования
         window = self.window()
         if hasattr(window, 'force_update_thumbnail'):
-            # Устанавливаем статус перед обновлением
             if hasattr(window, 'image_status'):
                 window.image_status[self.cur_page] = 'modified'
             window.force_update_thumbnail(self.cur_page)
 
-        # Отправка сигнала об изменении
         self.mask_updated.emit(self.cur_page)
 
-        # Сбрасываем состояние рисования
         self.drawing = False
         self.last_pt = None
 
         super().mouseReleaseEvent(event)
 
+    def focusOutEvent(self, event):
+        # Сброс состояния рисования при потере фокуса
+        self.drawing = False
+        self.last_pt = None
+        super().focusOutEvent(event)
+
+    def leaveEvent(self, event):
+        # Сброс состояния рисования при выходе курсора
+        self.drawing = False
+        self.last_pt = None
+        super().leaveEvent(event)
     def wheelEvent(self, event):
         """Обработка колесика мыши для масштабирования"""
         if event.modifiers() == Qt.ControlModifier:
@@ -602,7 +583,9 @@ class CustomImageViewer(QGraphicsView):
             if 0.05 <= new_scale <= 20.0:
                 self.scale(z, z)
                 self.scale_factor = new_scale
+                # ДОБАВЛЕНО: отключаем автоподгонку при ручном масштабировании
                 self.fit_to_view = False
+                self._initial_fit_done = True
             event.accept()
         elif event.modifiers() == Qt.AltModifier and self.draw_mode != DrawingMode.NONE:
             # Изменение размера кисти с помощью Alt+колесико

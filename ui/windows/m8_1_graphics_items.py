@@ -1,25 +1,20 @@
 # -*- coding: utf-8 -*-
-# ui/windows/m8_1_graphics_items.py
 from PySide6.QtCore import Qt, QRectF, QPointF, QEvent
-from PySide6.QtWidgets import QGraphicsItem, QGraphicsRectItem, QGraphicsPolygonItem, QGraphicsPathItem, \
-    QGraphicsEllipseItem
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsRectItem, QGraphicsPolygonItem, QGraphicsPathItem, QGraphicsEllipseItem
 from PySide6.QtGui import QPen, QBrush, QColor, QPolygonF, QPainterPath
-
 
 class SelectionEvent(QEvent):
     Type = QEvent.Type(QEvent.User + 1)
-
     def __init__(self, rect):
         super().__init__(SelectionEvent.Type)
         self.rect = rect
 
-
 class EditableMask(QGraphicsRectItem):
-    def __init__(self, x, y, width, height, mask_type, class_name, confidence, color, parent=None):
-        super().__init__(x, y, width, height, parent)
+    def __init__(self, x, y, w, h, mask_type, class_name, conf, color, parent=None):
+        super().__init__(x, y, w, h, parent)
         self.mask_type = mask_type
         self.class_name = class_name
-        self.confidence = confidence
+        self.confidence = conf
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
@@ -40,14 +35,13 @@ class EditableMask(QGraphicsRectItem):
     def hoverMoveEvent(self, event):
         rect = self.rect()
         pos = event.pos()
-        threshold = 10
+        thresh = 10
 
-        # Угловые зоны для изменения размера
-        if ((pos.x() < rect.left() + threshold and pos.y() < rect.top() + threshold) or
-                (pos.x() > rect.right() - threshold and pos.y() > rect.bottom() - threshold)):
+        if ((pos.x() < rect.left() + thresh and pos.y() < rect.top() + thresh) or
+                (pos.x() > rect.right() - thresh and pos.y() > rect.bottom() - thresh)):
             self.setCursor(Qt.SizeFDiagCursor)
-        elif ((pos.x() > rect.right() - threshold and pos.y() < rect.top() + threshold) or
-              (pos.x() < rect.left() + threshold and pos.y() > rect.bottom() - threshold)):
+        elif ((pos.x() > rect.right() - thresh and pos.y() < rect.top() + thresh) or
+              (pos.x() < rect.left() + thresh and pos.y() > rect.bottom() - thresh)):
             self.setCursor(Qt.SizeBDiagCursor)
         else:
             self.setCursor(Qt.SizeAllCursor)
@@ -57,19 +51,18 @@ class EditableMask(QGraphicsRectItem):
         if event.button() == Qt.LeftButton:
             rect = self.rect()
             pos = event.pos()
-            threshold = 10
+            thresh = 10
 
-            # Определяем, за какой угол захватили маску
-            if pos.x() < rect.left() + threshold and pos.y() < rect.top() + threshold:
+            if pos.x() < rect.left() + thresh and pos.y() < rect.top() + thresh:
                 self.resizing = True
                 self.resize_corner = "top-left"
-            elif pos.x() > rect.right() - threshold and pos.y() < rect.top() + threshold:
+            elif pos.x() > rect.right() - thresh and pos.y() < rect.top() + thresh:
                 self.resizing = True
                 self.resize_corner = "top-right"
-            elif pos.x() < rect.left() + threshold and pos.y() > rect.bottom() - threshold:
+            elif pos.x() < rect.left() + thresh and pos.y() > rect.bottom() - thresh:
                 self.resizing = True
                 self.resize_corner = "bottom-left"
-            elif pos.x() > rect.right() - threshold and pos.y() > rect.bottom() - threshold:
+            elif pos.x() > rect.right() - thresh and pos.y() > rect.bottom() - thresh:
                 self.resizing = True
                 self.resize_corner = "bottom-right"
             else:
@@ -79,86 +72,75 @@ class EditableMask(QGraphicsRectItem):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        """Улучшенная обработка движения мыши"""
         if self.resizing and self.resize_corner:
             rect = self.rect()
             pos = event.pos()
 
-            # Старые размеры
-            old_width = rect.width()
-            old_height = rect.height()
+            old_w = rect.width()
+            old_h = rect.height()
             old_x = rect.x()
             old_y = rect.y()
 
-            # Новые координаты и размеры
-            new_x, new_y, new_width, new_height = old_x, old_y, old_width, old_height
+            new_x, new_y, new_w, new_h = old_x, old_y, old_w, old_h
 
-            # Изменение размера с учетом угла захвата
             if self.resize_corner == "top-left":
-                # Защита от "выворачивания" маски
-                if pos.x() < old_x + old_width - 5 and pos.y() < old_y + old_height - 5:
+                if pos.x() < old_x + old_w - 5 and pos.y() < old_y + old_h - 5:
                     new_x = pos.x()
                     new_y = pos.y()
-                    new_width = old_width - (pos.x() - old_x)
-                    new_height = old_height - (pos.y() - old_y)
+                    new_w = old_w - (pos.x() - old_x)
+                    new_h = old_h - (pos.y() - old_y)
             elif self.resize_corner == "top-right":
-                # Защита от "выворачивания" маски
-                if pos.x() > old_x + 5 and pos.y() < old_y + old_height - 5:
+                if pos.x() > old_x + 5 and pos.y() < old_y + old_h - 5:
                     new_y = pos.y()
-                    new_width = pos.x() - old_x
-                    new_height = old_height - (pos.y() - old_y)
+                    new_w = pos.x() - old_x
+                    new_h = old_h - (pos.y() - old_y)
             elif self.resize_corner == "bottom-left":
-                # Защита от "выворачивания" маски
-                if pos.x() < old_x + old_width - 5 and pos.y() > old_y + 5:
+                if pos.x() < old_x + old_w - 5 and pos.y() > old_y + 5:
                     new_x = pos.x()
-                    new_width = old_width - (pos.x() - old_x)
-                    new_height = pos.y() - old_y
+                    new_w = old_w - (pos.x() - old_x)
+                    new_h = pos.y() - old_y
             elif self.resize_corner == "bottom-right":
-                # Защита от "выворачивания" маски
                 if pos.x() > old_x + 5 and pos.y() > old_y + 5:
-                    new_width = pos.x() - old_x
-                    new_height = pos.y() - old_y
+                    new_w = pos.x() - old_x
+                    new_h = pos.y() - old_y
 
-            # Проверка минимального размера (5x5 пикселей)
-            if new_width >= 5 and new_height >= 5:
-                self.setRect(new_x, new_y, new_width, new_height)
-
-            # Принудительное обновление всей сцены
-            if self.scene():
-                self.scene().update()
+            if new_w >= 5 and new_h >= 5:
+                self.setRect(new_x, new_y, new_w, new_h)
         else:
             super().mouseMoveEvent(event)
 
-        # Обновление сцены после любого движения
-        if self.scene():
-            self.scene().update()
-
-
-
     def mouseReleaseEvent(self, event):
-        """Улучшенная обработка отпускания кнопки мыши"""
         self.resizing = False
-
-        # Принудительное полное обновление сцены
-        if self.scene():
-            scene_rect = self.scene().sceneRect()
-            self.scene().update(scene_rect)
-
+        self.resize_corner = None
         super().mouseReleaseEvent(event)
 
     def set_page_index(self, index):
-        """Привязка маски к конкретной странице"""
         self.page_index = index
 
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange and self.scene():
+            new_pos = value
+            rect = self.scene().sceneRect()
+
+            if not rect.contains(self.mapToScene(self.rect()).boundingRect()):
+                if new_pos.x() < rect.left():
+                    new_pos.setX(rect.left())
+                if new_pos.y() < rect.top():
+                    new_pos.setY(rect.top())
+                if new_pos.x() + self.rect().width() > rect.right():
+                    new_pos.setX(rect.right() - self.rect().width())
+                if new_pos.y() + self.rect().height() > rect.bottom():
+                    new_pos.setY(rect.bottom() - self.rect().height())
+                return new_pos
+
+        return super().itemChange(change, value)
     def mouseDoubleClickEvent(self, event):
-        """Обработка двойного клика - удаление маски"""
         self.deleted = True
         self.setVisible(False)
         super().mouseDoubleClickEvent(event)
 
-
 class EditablePolygonMask(QGraphicsPolygonItem):
-    def __init__(self, points, mask_type, class_name, confidence, color, parent=None, editing=False):
+    def __init__(self, points, mask_type, class_name, conf, color, parent=None, editing=False):
         polygon = QPolygonF()
         for point in points:
             polygon.append(QPointF(point[0], point[1]))
@@ -166,7 +148,7 @@ class EditablePolygonMask(QGraphicsPolygonItem):
         super().__init__(polygon, parent)
         self.mask_type = mask_type
         self.class_name = class_name
-        self.confidence = confidence
+        self.confidence = conf
         self.deleted = False
         self.editing = editing
         self.points = points
@@ -213,15 +195,12 @@ class EditablePolygonMask(QGraphicsPolygonItem):
         self.setPolygon(polygon)
 
     def set_page_index(self, index):
-        """Привязка маски к конкретной странице"""
         self.page_index = index
 
     def mouseDoubleClickEvent(self, event):
-        """Обработка двойного клика - удаление маски"""
         self.deleted = True
         self.setVisible(False)
         super().mouseDoubleClickEvent(event)
-
 
 class BrushStroke(QGraphicsPathItem):
     def __init__(self, color, size, parent=None):
@@ -233,7 +212,6 @@ class BrushStroke(QGraphicsPathItem):
         self.page_index = None
         self.mask_type = 'brush'
 
-        # Создаем перо
         pen = QPen(QColor(*color))
         pen.setWidth(size)
         pen.setCapStyle(Qt.RoundCap)
@@ -242,7 +220,6 @@ class BrushStroke(QGraphicsPathItem):
         self.setZValue(100)
 
     def set_page_index(self, index):
-        """Привязка маски к конкретной странице"""
         self.page_index = index
 
     def clip_to_page_bounds(self, width, height):
@@ -265,15 +242,13 @@ class BrushStroke(QGraphicsPathItem):
         self.path = clipped_path
 
     def mouseDoubleClickEvent(self, event):
-        """Обработка двойного клика - удаление штриха"""
         self.deleted = True
         self.setVisible(False)
         super().mouseDoubleClickEvent(event)
 
-
 class SelectionRect(QGraphicsRectItem):
-    def __init__(self, x, y, width, height, parent=None):
-        super().__init__(x, y, width, height, parent)
+    def __init__(self, x, y, w, h, parent=None):
+        super().__init__(x, y, w, h, parent)
         pen = QPen(QColor(0, 255, 255))
         pen.setWidth(2)
         pen.setStyle(Qt.DashLine)

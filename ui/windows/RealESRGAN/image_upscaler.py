@@ -5,7 +5,7 @@ import glob
 import numpy as np
 from PIL import Image
 from typing import Optional, List, Callable
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Manager
 from functools import partial
 import requests  # Для загрузки модели GFPGAN и Real-ESRGAN
 
@@ -21,23 +21,28 @@ from gfpgan import GFPGANer
 # Глобальные переменные для upsampler и face_enhancer
 upsampler = None
 face_enhancer = None
+stop_flag = None  # Добавлен глобальный флаг остановки
 
 
 def init_worker(model_folder: str, model_name: str, denoise_strength: float,
                 outscale: float, tile: int, tile_pad: int, pre_pad: int,
                 face_enhance: bool, fp32: bool, alpha_upsampler: str,
-                gpu_id: Optional[int], gfpgan_model_path: Optional[str]):
+                gpu_id: Optional[int], gfpgan_model_path: Optional[str],
+                shared_stop_flag):  # Добавлен параметр для флага остановки
     """
     Инициализатор для каждого процесса. Настраивает RealESRGANer и GFPGANer (если требуется).
     """
     global upsampler
     global face_enhancer
+    global stop_flag
+
+    stop_flag = shared_stop_flag  # Сохраняем ссылку на общий флаг
 
     print(f"🔧 Инициализация процесса с моделью {model_name} на GPU {gpu_id}...")
 
     # Определение модели в зависимости от имени
     model_path = os.path.join(model_folder, f'{model_name}.pth')
-    print(f"🔍 Проверка наличия модели по пути: {model_path}")  # Добавлено
+    print(f"🔍 Проверка наличия модели по пути: {model_path}")
 
     if not os.path.isfile(model_path):
         raise FileNotFoundError(f"🚫 Модель {model_name} не найдена в папке {model_folder}")
@@ -116,15 +121,15 @@ def init_worker(model_folder: str, model_name: str, denoise_strength: float,
 def process_single_image(args: tuple, output_path: str, suffix: str, outscale: float, face_enhance: bool):
     """
     Обрабатывает одно изображение: повышает его разрешение и сохраняет результат.
-
-    :param args: Кортеж (path, idx)
-    :param output_path: Путь для сохранения улучшенных изображений.
-    :param suffix: Суффикс для сохранённых изображений.
-    :param outscale: Коэффициент увеличения разрешения.
-    :param face_enhance: Флаг для улучшения лиц.
     """
     global upsampler
     global face_enhancer
+    global stop_flag
+
+    # Проверяем флаг остановки перед началом обработки
+    if stop_flag and stop_flag.value:
+        print("⏹️ Обработка остановлена пользователем")
+        return
 
     path, idx = args
     imgname, extension = os.path.splitext(os.path.basename(path))
@@ -139,6 +144,11 @@ def process_single_image(args: tuple, output_path: str, suffix: str, outscale: f
         print(f"⚠️ Ошибка загрузки изображения {path}: {e}")
         return
 
+    # Проверяем флаг остановки перед обработкой
+    if stop_flag and stop_flag.value:
+        print("⏹️ Обработка остановлена пользователем")
+        return
+
     try:
         if face_enhance and face_enhancer is not None:
             print("🔍 Улучшение лиц с помощью GFPGAN...")
@@ -150,6 +160,11 @@ def process_single_image(args: tuple, output_path: str, suffix: str, outscale: f
     except RuntimeError as error:
         print(f"❌ Ошибка при обработке {imgname}: {error}")
         print('💡 Если вы столкнулись с ошибкой CUDA out of memory, попробуйте установить меньший размер тайла.')
+        return
+
+    # Проверяем флаг остановки перед сохранением
+    if stop_flag and stop_flag.value:
+        print("⏹️ Обработка остановлена пользователем")
         return
 
     # Определение расширения файла
@@ -186,30 +201,15 @@ def enhance_image(
         alpha_upsampler: str = 'realesrgan',
         suffix: str = 'out',
         gpu_id: Optional[int] = None,
-        num_processes: Optional[int] = None,  # Добавлено для контроля числа процессов
-        gfpgan_model_path: Optional[str] = None,  # Добавлен путь к модели GFPGAN
-        progress_callback: Optional[Callable[[int], None]] = None  # Добавлен callback
+        num_processes: Optional[int] = None,
+        gfpgan_model_path: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        stop_callback: Optional[Callable[[], bool]] = None  # Добавлен callback для проверки остановки
 ):
     """
     Функция для повышения разрешения изображений с использованием Real-ESRGAN.
 
-    :param input_path: Путь к входному изображению или папке с изображениями.
-    :param output_path: Путь к папке для сохранения обработанных изображений.
-    :param model_folder: Путь к папке с моделями Real-ESRGAN.
-    :param model_name: Название модели (по умолчанию 'RealESRGAN_x4plus_anime_6B').
-    :param denoise_strength: Сила шумоподавления (только для модели 'realesr-general-x4v3').
-    :param outscale: Коэффициент увеличения разрешения.
-    :param tile: Размер тайла для обработки (0 для отключения).
-    :param tile_pad: Отступ тайла.
-    :param pre_pad: Предварительный отступ.
-    :param face_enhance: Использовать ли GFPGAN для улучшения лиц.
-    :param fp32: Использовать ли точность fp32 (по умолчанию False, используется fp16).
-    :param alpha_upsampler: Апсемплер для альфа-каналов ('realesrgan' или 'bicubic').
-    :param suffix: Суффикс для сохраненных изображений.
-    :param gpu_id: ID GPU для использования (по умолчанию None).
-    :param num_processes: Количество процессов для многопроцессорной обработки (по умолчанию число CPU).
-    :param gfpgan_model_path: Путь к модели GFPGAN (обязательно, если face_enhance=True).
-    :param progress_callback: Функция обратного вызова для обновления прогресса (0-100).
+    :param stop_callback: Функция, возвращающая True если нужно остановить процесс
     """
     print("🔍 Начало процесса повышения разрешения изображений...")
 
@@ -251,25 +251,42 @@ def enhance_image(
     if face_enhance and gfpgan_model_path is None:
         gfpgan_model_path = os.path.join(model_folder, 'GFPGANv1.3.pth')
 
+    # Создаем общий флаг остановки для всех процессов
+    manager = Manager()
+    shared_stop_flag = manager.Value('b', False)  # 'b' для boolean
+
     # Инициализация пула процессов
     pool = Pool(
         processes=num_processes,
         initializer=init_worker,
         initargs=(model_folder, model_name, denoise_strength,
                   outscale, tile, tile_pad, pre_pad,
-                  face_enhance, fp32, alpha_upsampler, gpu_id, gfpgan_model_path if face_enhance else None)
+                  face_enhance, fp32, alpha_upsampler, gpu_id,
+                  gfpgan_model_path if face_enhance else None,
+                  shared_stop_flag)  # Передаем флаг остановки
     )
 
     args = [(path, idx) for idx, path in enumerate(paths)]
     processed = 0
+    results = []
 
     # Функция для обновления прогресса
     def update_progress(_):
         nonlocal processed
         processed += 1
+
+        # Проверяем флаг остановки через callback
+        if stop_callback and stop_callback():
+            shared_stop_flag.value = True
+            print("⏹️ Получен сигнал остановки")
+
         if progress_callback:
             progress = int((processed / total_images) * 100)
-            progress_callback(progress)
+            result = progress_callback(progress)
+            # Если callback вернул -1, останавливаем процесс
+            if result == -1:
+                shared_stop_flag.value = True
+                print("⏹️ Получен сигнал остановки через progress_callback")
 
     partial_process = partial(
         process_single_image,
@@ -282,45 +299,77 @@ def enhance_image(
     try:
         # Запуск асинхронных задач
         for path_idx in args:
-            pool.apply_async(
+            result = pool.apply_async(
                 partial_process,
                 args=(path_idx,),
                 callback=update_progress
             )
+            results.append(result)
+
+        # Периодически проверяем флаг остановки
+        while results:
+            completed = []
+            for i, result in enumerate(results):
+                if result.ready():
+                    completed.append(i)
+                elif shared_stop_flag.value or (stop_callback and stop_callback()):
+                    # Если получен сигнал остановки, останавливаем пул
+                    shared_stop_flag.value = True
+                    print("⏹️ Остановка обработки...")
+                    pool.terminate()
+                    pool.join()
+                    print("✅ Обработка остановлена")
+                    return -1  # Возвращаем специальный код остановки
+
+            # Удаляем завершенные задачи
+            for i in reversed(completed):
+                results.pop(i)
+
+            # Небольшая задержка чтобы не нагружать CPU
+            import time
+            time.sleep(0.1)
 
         pool.close()
         pool.join()
+
     except Exception as e:
         print(f"❌ Произошла ошибка во время многопроцессорной обработки: {e}")
-    finally:
-        pool.close()
+        pool.terminate()
         pool.join()
+        return -1
+    finally:
+        # Убеждаемся, что пул закрыт
+        try:
+            pool.close()
+            pool.join()
+        except:
+            pass
 
     print("🔍 Процесс повышения разрешения изображений завершён.")
+    return 0  # Успешное завершение
 
 
 if __name__ == '__main__':
     # Пример использования при запуске скрипта напрямую
-    # Замените эти пути на относительные или абсолютные по необходимости
     input_path = 'C:\\Users\\Matve\\Desktop\\Тест'
     output_path = 'D:\\PyCharmProject\\GraphicNovelCleaner\\GraphicNovelCleaner+\\13. MangaLocalizer\\data\\output'
 
     enhance_image(
-        input_path=input_path,  # Путь к папке с входными изображениями
-        output_path=output_path,  # Путь для сохранения
-        model_folder=os.path.join(os.path.dirname(__file__), 'RealESRGAN'),  # Путь к папке с моделями
-        model_name='RealESRGAN_x4plus_anime_6B',  # Название модели
-        denoise_strength=0.5,  # Сила шумоподавления (не используется для данной модели)
-        outscale=4.0,  # Коэффициент увеличения разрешения (рекомендуется 4)
-        tile=256,  # Размер тайла (0 для отключения)
-        tile_pad=10,  # Отступ тайла
-        pre_pad=0,  # Предварительный отступ
-        face_enhance=True,  # Установите True, если хотите улучшить лица
-        fp32=False,  # Использовать fp16 точность
-        alpha_upsampler='realesrgan',  # Апсемплер для альфа-каналов
-        suffix='enhanced',  # Суффикс для сохранённых изображений
-        gpu_id=0,  # ID вашего GPU или None для автоматического выбора
-        num_processes=1,  # Ограничение числа процессов до 1 для одного GPU
-        gfpgan_model_path=None,  # Путь к модели GFPGAN, если необходимо
+        input_path=input_path,
+        output_path=output_path,
+        model_folder=os.path.join(os.path.dirname(__file__), 'RealESRGAN'),
+        model_name='RealESRGAN_x4plus_anime_6B',
+        denoise_strength=0.5,
+        outscale=4.0,
+        tile=256,
+        tile_pad=10,
+        pre_pad=0,
+        face_enhance=True,
+        fp32=False,
+        alpha_upsampler='realesrgan',
+        suffix='enhanced',
+        gpu_id=0,
+        num_processes=1,
+        gfpgan_model_path=None,
         progress_callback=lambda p: print(f"🔄 Прогресс: {p}%")
     )

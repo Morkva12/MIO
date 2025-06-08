@@ -21,7 +21,8 @@ from ui.windows.m6_2_enhancement import EnhancementWorker
 from ui.windows.m6_3_utils import (get_images_from_folder, prepare_images_and_folders,
                                    populate_gpu_options, handle_sync_slider, show_message,
                                    PageChangeSignal, check_enhanced_availability, delete_enhanced_image,
-                                   delete_all_enhanced)
+                                   delete_all_enhanced, get_file_hash, detect_folder_changes,
+                                   get_folder_state, sync_enhanced_images, copy_images)
 from ui.windows.m6_4_ui_components import (ImageLoader, LoadingOverlay,
                                            ImageLoadedEvent, AllImagesLoadedEvent)
 
@@ -122,9 +123,15 @@ class PreprocessingWindow(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.bg_widget)
-
+        self._closing = False
         # Активный воркер
         self.enhancement_worker = None
+        self.active_timers = []
+        self.scale_warning_shown = False
+
+        # Состояние папки загрузки для отслеживания изменений
+        self.upload_folder_state = {}
+        self.last_sync_check = None
 
         # Таймер для периодической проверки улучшенных изображений
         self.check_enhanced_timer = QTimer(self)
@@ -142,9 +149,11 @@ class PreprocessingWindow(QDialog):
 
         # Загружаем статус проекта
         self.loadStatus()
+        self.active_timers = []
 
         # Показываем загрузочный экран и начинаем загрузку изображений
         QTimer.singleShot(100, self.startLoading)
+        QTimer.singleShot(1000, self.check_initial_sync)
 
     def startLoading(self):
         """Начало загрузки изображений с блокировкой интерфейса"""
@@ -211,6 +220,212 @@ class PreprocessingWindow(QDialog):
         # Запускаем загрузку изображений
         QTimer.singleShot(200, lambda: self.image_loader.start_loading(0))
 
+    def check_initial_sync(self):
+        """Проверяет необходимость синхронизации при открытии окна"""
+        logger.info("=== НАЧАЛО check_initial_sync ===")
+
+        if hasattr(self, '_closing') and self._closing:
+            logger.info("Окно закрывается, выход из check_initial_sync")
+            return
+
+        logger.info("Окно активно, продолжаем проверку")
+
+        try:
+            # Получаем полные пути для анализа
+            logger.info(f"Папка загрузки: {self.ch_paths['upload']}")
+            logger.info(f"Папка оригиналов: {self.originals_folder}")
+
+            upload_files = []
+            originals_files = []
+
+            logger.info("Сканирование папки загрузки...")
+            for f in sorted(os.listdir(self.ch_paths["upload"])):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')) and not f.startswith('temp_'):
+                    full_path = os.path.join(self.ch_paths["upload"], f)
+                    upload_files.append(full_path)
+                    logger.debug(f"  Найден файл в загрузке: {f}")
+
+            logger.info(f"Всего файлов в загрузке: {len(upload_files)}")
+
+            logger.info("Сканирование папки оригиналов...")
+            for f in sorted(os.listdir(self.originals_folder)):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
+                    full_path = os.path.join(self.originals_folder, f)
+                    originals_files.append(full_path)
+                    logger.debug(f"  Найден файл в оригиналах: {f}")
+
+            logger.info(f"Всего файлов в оригиналах: {len(originals_files)}")
+
+            # Используем detect_folder_changes для анализа
+            logger.info("Вызов detect_folder_changes...")
+            changes = detect_folder_changes(upload_files, originals_files)
+            logger.info(f"Результат detect_folder_changes: {changes}")
+
+            # Проверяем есть ли изменения
+            has_changes = any([changes['added'], changes['removed'], changes['modified'], changes['renamed']])
+            logger.info(f"Есть изменения: {has_changes}")
+
+            if has_changes:
+                logger.info("!!! ОБНАРУЖЕНЫ ИЗМЕНЕНИЯ !!!")
+                logger.info(f"  Добавлено: {len(changes['added'])} файлов")
+                logger.info(f"  Удалено: {len(changes['removed'])} файлов")
+                logger.info(f"  Изменено: {len(changes['modified'])} файлов")
+                logger.info(f"  Переименовано: {len(changes['renamed'])} пар")
+
+                logger.info("Импорт SyncDialog...")
+                from ui.windows.m6_4_ui_components import SyncDialog
+                logger.info("SyncDialog импортирован успешно")
+
+                logger.info("Создание экземпляра SyncDialog...")
+                dialog = SyncDialog(changes, self)
+                logger.info("SyncDialog создан")
+
+                logger.info("Показ диалога (вызов exec)...")
+                sync_mode = dialog.exec()
+                logger.info(f"!!! Диалог закрыт, возвращено значение: '{sync_mode}'")
+                logger.info(f"    Тип возвращенного значения: {type(sync_mode)}")
+                logger.info(f"    repr значения: {repr(sync_mode)}")
+
+                logger.info(f"Проверка условия: sync_mode not in ['cancel', 'none']")
+                logger.info(f"    sync_mode == 'cancel': {sync_mode == 'cancel'}")
+                logger.info(f"    sync_mode == 'none': {sync_mode == 'none'}")
+                logger.info(f"    Условие выполнено: {sync_mode not in ['cancel', 'none']}")
+
+                if sync_mode not in ['cancel', 'none']:
+                    logger.info(f"!!! ЗАПУСК СИНХРОНИЗАЦИИ с режимом: {sync_mode}")
+                    logger.info("Вызов self.perform_sync...")
+                    self.perform_sync(sync_mode)
+                    logger.info("perform_sync завершен")
+                else:
+                    logger.info(f"!!! СИНХРОНИЗАЦИЯ ОТМЕНЕНА, режим: {sync_mode}")
+            else:
+                logger.info("Изменений не обнаружено, синхронизация не требуется")
+
+        except Exception as e:
+            logger.error(f"!!! ОШИБКА в check_initial_sync: {e}", exc_info=True)
+            logger.error(f"Тип исключения: {type(e)}")
+            logger.error(f"Детали: {str(e)}")
+
+        logger.info("=== КОНЕЦ check_initial_sync ===")
+
+    def _finalize_sync(self, results):
+        """Завершение синхронизации"""
+        # Перезагружаем список изображений
+        self.image_paths = get_images_from_folder(self.originals_folder)
+
+        if hasattr(self, 'viewer') and self.viewer:
+            self.viewer.pages = self.image_paths
+            if hasattr(self.viewer, 'page_pixmap_item') and self.viewer.page_pixmap_item:
+                self.viewer.reloadOriginalPixmaps()
+
+        if not (hasattr(self, '_closing') and self._closing):
+            self._reloadThumbnails()
+
+        # Показываем результаты
+        if results['errors']:
+            error_text = "\n".join(results['errors'][:5])
+            show_message(self, "Синхронизация завершена с ошибками",
+                         f"Синхронизация выполнена, но возникли ошибки:\n{error_text}",
+                         QMessageBox.Warning)
+        else:
+            info_text = f"Синхронизировано: {results['synced']} файлов\n"
+            if results['deleted'] > 0:
+                info_text += f"Удалено: {results['deleted']} улучшенных\n"
+            if results['renamed'] > 0:
+                info_text += f"Переименовано: {results['renamed']} улучшенных"
+            show_message(self, "Синхронизация завершена", info_text)
+
+        self.update_project_info()
+        self.check_enhanced_availability()
+    def showEnhancementDialog(self):
+        """Показывает диалог выбора режима улучшения"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Выбор режима улучшения")
+        dialog.setModal(True)
+        dialog.setFixedWidth(400)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        # Заголовок
+        label = QLabel("Выберите режим улучшения изображений:")
+        label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(label)
+
+        # Информация о текущей странице
+        current_page_info = QLabel(f"Текущая страница: {self.viewer.current_page + 1} из {len(self.image_paths)}")
+        current_page_info.setStyleSheet("font-size: 12px; color: #888;")
+        layout.addWidget(current_page_info)
+
+        # Кнопки выбора
+        buttons_layout = QVBoxLayout()
+        buttons_layout.setSpacing(10)
+
+        # Кнопка "Улучшить текущее"
+        current_btn = QPushButton(f"Улучшить только текущее изображение (стр. {self.viewer.current_page + 1})")
+        current_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7E1E9F;
+                color: white;
+                border-radius: 8px;
+                padding: 12px 20px;
+                font-size: 14px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #9E3EAF;
+            }
+        """)
+        current_btn.clicked.connect(lambda: dialog.done(1))  # Вернуть 1 для текущего
+        buttons_layout.addWidget(current_btn)
+
+        # Кнопка "Улучшить все"
+        all_btn = QPushButton(f"Улучшить все изображения ({len(self.image_paths)} шт.)")
+        all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #5E7E9F;
+                color: white;
+                border-radius: 8px;
+                padding: 12px 20px;
+                font-size: 14px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #6E8EAF;
+            }
+        """)
+        all_btn.clicked.connect(lambda: dialog.done(2))  # Вернуть 2 для всех
+        buttons_layout.addWidget(all_btn)
+
+        layout.addLayout(buttons_layout)
+        layout.addStretch()
+
+        # Кнопка отмены
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #777;
+            }
+        """)
+        cancel_btn.clicked.connect(lambda: dialog.done(0))  # Вернуть 0 для отмены
+
+        cancel_layout = QHBoxLayout()
+        cancel_layout.addStretch()
+        cancel_layout.addWidget(cancel_btn)
+        layout.addLayout(cancel_layout)
+
+        return dialog.exec()
+
     def load_enhanced_images_cache(self):
         """Загрузка улучшенных изображений в кэш для ускорения переключения"""
         if not hasattr(self, 'image_paths') or not self.image_paths:
@@ -236,8 +451,8 @@ class PreprocessingWindow(QDialog):
             self.loading_overlay.info_label.setText("Отмена загрузки...")
             self.loading_overlay.cancel_button.setEnabled(False)
 
-        # Посылаем сигнал возврата через 500мс
-        QTimer.singleShot(500, self.back_requested.emit)
+        # Используем наш новый метод для отложенного действия
+        self._createDelayedAction(500, self.back_requested.emit)
 
     def onImageLoaded(self, idx, pixmap, current_file):
         """Обработка загрузки изображения"""
@@ -326,6 +541,15 @@ class PreprocessingWindow(QDialog):
         self.back_requested.emit()
         self.close()
 
+    def _cleanup_gpu_resources(self):
+        """Очистка GPU ресурсов при закрытии"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except:
+            pass
     def resizeEvent(self, event):
         """Обработчик изменения размера окна"""
         super().resizeEvent(event)
@@ -567,19 +791,26 @@ class PreprocessingWindow(QDialog):
             orig_kb += kb
             orig_mb += mb
 
-        # Подсчет размеров улучшенных файлов
-        enh_kb, enh_mb = 0, 0
+        # Подсчет размеров конечного проекта (улучшенные + оригинальные где нет улучшенных)
+        final_kb, final_mb = 0, 0
         enh_count = 0
+
         for path in self.image_paths:
             base = os.path.splitext(os.path.basename(path))[0]
             ext = os.path.splitext(path)[1]
             enh_path = os.path.join(self.enhanced_folder, f"{base}_enhanced{ext}")
 
             if os.path.exists(enh_path):
+                # Если есть улучшенное, считаем его размер
                 enh_count += 1
                 kb, mb = self._calculate_file_size(enh_path)
-                enh_kb += kb
-                enh_mb += mb
+                final_kb += kb
+                final_mb += mb
+            else:
+                # Если нет улучшенного, считаем размер оригинала
+                kb, mb = self._calculate_file_size(path)
+                final_kb += kb
+                final_mb += mb
 
         # Формируем текст с улучшенным форматированием
         info_text = ""
@@ -591,12 +822,23 @@ class PreprocessingWindow(QDialog):
 
         # Информация о конечном проекте
         info_text += f"<b style='color:#AAFFAA;'>Конечный проект:</b><br>"
+        info_text += f"Всего файлов: {len(self.image_paths)}<br>"
         if enh_count > 0:
-            info_text += f"Улучшенные изображения: {enh_count} из {len(self.image_paths)}<br>"
-            info_text += f"Общий размер: {enh_kb:.1f} КБ ({enh_mb:.2f} МБ)<br>"
+            info_text += f"Из них улучшенных: {enh_count}<br>"
+            info_text += f"Оригинальных: {len(self.image_paths) - enh_count}<br>"
         else:
-            info_text += "Включает оригинальные изображения<br>"
-            info_text += f"Общий размер: {orig_kb:.1f} КБ ({orig_mb:.2f} МБ)<br>"
+            info_text += f"Все оригинальные<br>"
+        info_text += f"Общий размер: {final_kb:.1f} КБ ({final_mb:.2f} МБ)<br>"
+
+        # Показываем разницу в размере, если есть улучшенные изображения
+        if enh_count > 0:
+            size_diff = final_mb - orig_mb
+            percent_change = ((final_mb - orig_mb) / orig_mb * 100) if orig_mb > 0 else 0
+
+            if size_diff > 0:
+                info_text += f"<span style='color:#FF9999;'>Увеличение: +{size_diff:.2f} МБ ({percent_change:.1f}%)</span>"
+            else:
+                info_text += f"<span style='color:#99FF99;'>Уменьшение: {size_diff:.2f} МБ ({percent_change:.1f}%)</span>"
 
         # Обновляем текст в панели
         self.project_info_text.setText(info_text)
@@ -619,6 +861,253 @@ class PreprocessingWindow(QDialog):
 
         # Обновляем информацию о проекте
         self.update_project_info()
+
+    def check_upload_folder_changes(self):
+        """Проверяет изменения в папке загрузки"""
+        # Не проверяем если идет процесс или окно закрывается
+        if self.is_proc or (hasattr(self, '_closing') and self._closing):
+            return
+
+        # Получаем текущее состояние папки загрузки
+        upload_folder = self.ch_paths["upload"]
+        current_state = get_folder_state(upload_folder)
+
+        # Проверяем изменения
+        changes = detect_folder_changes(current_state, self.upload_folder_state)
+
+        # Если есть изменения
+        if changes['added'] or changes['removed'] or changes['modified'] or changes['reordered']:
+            logger.info(f"Обнаружены изменения в папке загрузки: {changes}")
+
+            # Останавливаем таймер на время диалога
+            self.check_changes_timer.stop()
+
+            # Показываем диалог синхронизации
+            from ui.windows.m6_4_ui_components import SyncDialog
+            dialog = SyncDialog(changes, self)
+            sync_mode = dialog.exec()
+
+            if sync_mode != 'cancel':
+                # Обновляем состояние папки
+                self.upload_folder_state = current_state
+
+                if sync_mode != 'none':
+                    # Выполняем синхронизацию
+                    self.perform_sync(sync_mode)
+
+            # Возобновляем таймер
+            self.check_changes_timer.start(3000)
+        else:
+            # Обновляем состояние даже если нет изменений
+            self.upload_folder_state = current_state
+
+    def _reload_after_sync(self, results):
+        """Перезагрузка интерфейса после синхронизации"""
+        # Перезагружаем список изображений
+        self.image_paths = get_images_from_folder(self.originals_folder)
+
+        # Обновляем viewer
+        if hasattr(self, 'viewer') and self.viewer:
+            self.viewer.pages = self.image_paths
+            self.viewer.original_pixmaps = []
+            for path in self.image_paths:
+                pixmap = QPixmap(path)
+                self.viewer.original_pixmaps.append(pixmap)
+
+            # Сбрасываем на первую страницу
+            self.viewer.current_page = 0
+            self.viewer.displayCurrentPage()
+
+        # Перезагружаем миниатюры
+        self._reloadThumbnails()
+
+        # Показываем результаты
+        if results['errors']:
+            error_text = "\n".join(results['errors'][:5])
+            show_message(self, "Синхронизация завершена с ошибками",
+                         f"Синхронизация выполнена, но возникли ошибки:\n{error_text}",
+                         QMessageBox.Warning)
+        else:
+            info_text = f"Синхронизировано: {results['synced']} файлов\n"
+            if results['deleted'] > 0:
+                info_text += f"Удалено: {results['deleted']} улучшенных\n"
+            if results['renamed'] > 0:
+                info_text += f"Переименовано: {results['renamed']} улучшенных"
+            show_message(self, "Синхронизация завершена", info_text)
+
+        self.update_project_info()
+        self.check_enhanced_availability()
+
+    def perform_sync(self, sync_mode):
+        """Выполняет синхронизацию изображений"""
+        if hasattr(self, '_closing') and self._closing:
+            return
+
+        logger.info(f"Выполнение синхронизации в режиме: {sync_mode}")
+
+        try:
+            # Определяем изменения ДО копирования
+            upload_files = []
+            originals_files = []
+
+            for f in sorted(os.listdir(self.ch_paths["upload"])):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')) and not f.startswith('temp_'):
+                    upload_files.append(os.path.join(self.ch_paths["upload"], f))
+
+            for f in sorted(os.listdir(self.originals_folder)):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
+                    originals_files.append(os.path.join(self.originals_folder, f))
+
+            changes = detect_folder_changes(upload_files, originals_files)
+            rename_map = {old: new for old, new in changes['renamed']}
+
+            # ВАЖНО: Копируем файлы ВСЕГДА при preserve
+            logger.info(f"Копирование файлов из загрузки в originals...")
+            copied = copy_images(self.ch_paths["upload"], self.originals_folder)
+            logger.info(f"Скопировано {copied} файлов")
+
+            # Синхронизируем улучшенные
+            if sync_mode == 'preserve':
+                results = sync_enhanced_images(
+                    self.originals_folder,
+                    self.enhanced_folder,
+                    sync_mode,
+                    rename_map=rename_map
+                )
+
+                # Для modified файлов тоже считаем как синхронизированные
+                if changes['modified']:
+                    results['synced'] += len(changes['modified'])
+            else:
+                results = {'synced': 0, 'deleted': 0, 'renamed': 0, 'errors': []}
+
+            self._finalize_sync(results)
+
+        except Exception as e:
+            logger.error(f"Ошибка при синхронизации: {e}", exc_info=True)
+            show_message(self, "Ошибка", f"Произошла ошибка при синхронизации:\n{str(e)}", QMessageBox.Critical)
+
+    def reloadOriginalPixmaps(self):
+        """Перезагружает оригинальные изображения"""
+        # Проверяем что viewer еще существует
+        try:
+            if not hasattr(self, 'pages') or not self.pages:
+                return
+
+            self.original_pixmaps = []
+            for p in self.pages:
+                if os.path.isfile(p):
+                    pixmap = QPixmap(p)
+                    self.original_pixmaps.append(pixmap)
+
+            # Отображаем текущую страницу только если есть все необходимые элементы
+            if (hasattr(self, 'page_pixmap_item') and
+                    self.page_pixmap_item and
+                    hasattr(self, 'scene_') and
+                    self.scene_):
+                self.displayCurrentPage()
+        except RuntimeError as e:
+            logger.error(f"Ошибка при перезагрузке изображений: {e}")
+    def _reloadThumbnails(self):
+        """Перезагружает миниатюры после синхронизации"""
+        # Удаляем старые миниатюры
+        for container in self.preview_scroll_area.widget().findChildren(QWidget):
+            container.deleteLater()
+
+        self.thumbnail_labels = []
+        self.index_labels = []
+
+        # Создаем новые миниатюры
+        container_layout = self.preview_scroll_area.widget().layout()
+
+        thumbnail_width = 150
+        thumbnail_height = thumbnail_width * 2
+
+        for i, path in enumerate(self.image_paths):
+            thumb_container = QWidget()
+            thumb_layout = QVBoxLayout(thumb_container)
+            thumb_layout.setContentsMargins(0, 0, 0, 0)
+            thumb_layout.setSpacing(0)
+
+            # Миниатюра изображения
+            thumb_label = QLabel()
+            pm = QPixmap(path)
+            if not pm.isNull():
+                scaled_pix = pm.scaled(
+                    thumbnail_width, thumbnail_height,
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                thumb_label.setPixmap(scaled_pix)
+                thumb_label.setAlignment(Qt.AlignCenter)
+
+            thumb_label.setStyleSheet("""
+                QLabel {
+                    background-color: #222222;
+                    border: 2px solid transparent;
+                    border-top-left-radius: 8px;
+                    border-top-right-radius: 8px;
+                    border-bottom-left-radius: 0px;
+                    border-bottom-right-radius: 0px;
+                }
+            """)
+
+            # Номер страницы
+            index_label = QLabel(str(i + 1))
+            index_label.setAlignment(Qt.AlignCenter)
+            index_label.setStyleSheet("""
+                QLabel {
+                    color: white;
+                    background-color: #222222;
+                    font-size: 14px;
+                    font-weight: bold;
+                    border: 2px solid transparent;
+                    border-top-left-radius: 0px;
+                    border-top-right-radius: 0px;
+                    border-bottom-left-radius: 8px;
+                    border-bottom-right-radius: 8px;
+                }
+            """)
+
+            thumb_layout.addWidget(thumb_label)
+            thumb_layout.addWidget(index_label)
+
+            # Обработчик клика
+            thumb_label.mousePressEvent = self.makePreviewClickHandler(i)
+
+            self.thumbnail_labels.append(thumb_label)
+            self.index_labels.append(index_label)
+
+            container_layout.insertWidget(i, thumb_container)
+
+        # Обновляем активную миниатюру
+        if self.viewer.current_page < len(self.image_paths):
+            self.updateActiveThumbnail(self.viewer.current_page)
+
+    def _createDelayedAction(self, delay_ms, action):
+        """Создает отложенное действие с возможностью отмены"""
+        # Проверяем, что окно еще не закрывается
+        if hasattr(self, '_closing') and self._closing:
+            return None
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        # Обертка для безопасного вызова
+        def safe_action():
+            try:
+                # Проверяем, что объект еще существует
+                if self and not (hasattr(self, '_closing') and self._closing):
+                    action()
+            except RuntimeError:
+                pass  # Объект уже удален
+            finally:
+                if timer in self.active_timers:
+                    self.active_timers.remove(timer)
+
+        timer.timeout.connect(safe_action)
+        self.active_timers.append(timer)
+        timer.start(delay_ms)
+        return timer
 
     def _calculate_file_size(self, file_path):
         """Возвращает размер файла в КБ и МБ"""
@@ -761,9 +1250,8 @@ class PreprocessingWindow(QDialog):
         self.outscale_input.setFixedWidth(50)
         self.outscale_input.setStyleSheet("background-color: #FFFFFF; color: #000000;")
 
-        self.outscale_slider.valueChanged.connect(
-            lambda val: self.outscale_input.setText(f"{val / 100:.1f}")
-        )
+        self.outscale_slider.valueChanged.connect(self.onScaleChanged)
+
         self.outscale_input.editingFinished.connect(
             handle_sync_slider(self.outscale_slider, self.outscale_input, 0.25, 4.0, 100, 0.25)
         )
@@ -980,6 +1468,35 @@ class PreprocessingWindow(QDialog):
 
         return right_widget
 
+    def onScaleChanged(self, value):
+        """Обработчик изменения масштаба"""
+        # Обновляем поле ввода
+        scale_value = value / 100
+        self.outscale_input.setText(f"{scale_value:.1f}")
+
+        # Проверяем, не превышает ли масштаб 2x
+        if scale_value > 2.0 and not self.scale_warning_shown:
+            # Показываем предупреждение только один раз
+            self.scale_warning_shown = True
+
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Предупреждение о масштабе")
+            msg.setText("Внимание! Масштабирование более чем в 2 раза не рекомендуется.")
+            msg.setInformativeText(
+                "При увеличении изображений более чем в 2 раза, функция клининга (очистки) "
+                "станет недоступна из-за слишком высокого разрешения изображений.\n\n"
+                "Рекомендуется использовать масштаб не более 2.0x для сохранения "
+                "возможности последующей обработки."
+            )
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec()
+        elif scale_value <= 2.0:
+            # Сбрасываем флаг, если масштаб вернулся в нормальный диапазон
+            self.scale_warning_shown = False
+
+        # Обновляем информацию о проекте
+        self.update_project_info()
     def onImageTypeChanged(self, checked):
         """Обработчик изменения типа изображения"""
         if not checked:
@@ -1106,6 +1623,133 @@ class PreprocessingWindow(QDialog):
         else:
             logger.debug("Переход на следующую страницу не выполнен")
 
+    def showDeleteEnhancedDialog(self):
+        """Показывает диалог выбора режима удаления улучшенных изображений"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Удаление улучшенных изображений")
+        dialog.setModal(True)
+        dialog.setFixedWidth(450)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        # Заголовок
+        label = QLabel("Выберите режим удаления улучшенных изображений:")
+        label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(label)
+
+        # Проверяем наличие улучшенного изображения для текущей страницы
+        current_enhanced_exists = False
+        if 0 <= self.viewer.current_page < len(self.image_paths):
+            current_path = self.image_paths[self.viewer.current_page]
+            base = os.path.splitext(os.path.basename(current_path))[0]
+            ext = os.path.splitext(current_path)[1]
+            enh_path = os.path.join(self.enhanced_folder, f"{base}_enhanced{ext}")
+            current_enhanced_exists = os.path.exists(enh_path)
+
+        # Информация о текущей странице
+        current_page_info = QLabel(f"Текущая страница: {self.viewer.current_page + 1} из {len(self.image_paths)}")
+        current_page_info.setStyleSheet("font-size: 12px; color: #888;")
+        layout.addWidget(current_page_info)
+
+        # Кнопки выбора
+        buttons_layout = QVBoxLayout()
+        buttons_layout.setSpacing(10)
+
+        # Кнопка "Удалить текущее"
+        current_btn = QPushButton(
+            f"Удалить только текущее улучшенное изображение (стр. {self.viewer.current_page + 1})")
+        current_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #995500;
+                color: white;
+                border-radius: 8px;
+                padding: 12px 20px;
+                font-size: 14px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #AA6600;
+            }
+            QPushButton:disabled {
+                background-color: #666;
+                color: #999;
+            }
+        """)
+        current_btn.clicked.connect(lambda: dialog.done(1))  # Вернуть 1 для текущего
+        current_btn.setEnabled(current_enhanced_exists)
+
+        if not current_enhanced_exists:
+            current_btn.setText(
+                f"Удалить текущее (стр. {self.viewer.current_page + 1}) - улучшенное изображение отсутствует")
+
+        buttons_layout.addWidget(current_btn)
+
+        # Подсчитываем количество улучшенных изображений
+        enhanced_count = 0
+        for path in self.image_paths:
+            base = os.path.splitext(os.path.basename(path))[0]
+            ext = os.path.splitext(path)[1]
+            enh_path = os.path.join(self.enhanced_folder, f"{base}_enhanced{ext}")
+            if os.path.exists(enh_path):
+                enhanced_count += 1
+
+        # Кнопка "Удалить все"
+        all_btn = QPushButton(f"Удалить все улучшенные изображения ({enhanced_count} шт.)")
+        all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #CC3333;
+                color: white;
+                border-radius: 8px;
+                padding: 12px 20px;
+                font-size: 14px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #DD4444;
+            }
+            QPushButton:disabled {
+                background-color: #666;
+                color: #999;
+            }
+        """)
+        all_btn.clicked.connect(lambda: dialog.done(2))  # Вернуть 2 для всех
+        all_btn.setEnabled(enhanced_count > 0)
+
+        if enhanced_count == 0:
+            all_btn.setText("Удалить все - нет улучшенных изображений")
+
+        buttons_layout.addWidget(all_btn)
+
+        layout.addLayout(buttons_layout)
+        layout.addStretch()
+
+        # Кнопка отмены
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #777;
+            }
+        """)
+        cancel_btn.clicked.connect(lambda: dialog.done(0))  # Вернуть 0 для отмены
+
+        cancel_layout = QHBoxLayout()
+        cancel_layout.addStretch()
+        cancel_layout.addWidget(cancel_btn)
+        layout.addLayout(cancel_layout)
+
+        return dialog.exec()
+
     def onDeleteEnhanced(self):
         """Удаляет улучшенные изображения"""
         # Проверяем наличие улучшенных изображений
@@ -1115,10 +1759,62 @@ class PreprocessingWindow(QDialog):
             show_message(self, "Информация", "Нет улучшенных изображений для удаления.", QMessageBox.Information)
             return
 
+        # Показываем диалог выбора
+        choice = self.showDeleteEnhancedDialog()
+
+        if choice == 0:  # Отмена
+            return
+        elif choice == 1:  # Удалить текущее
+            self._deleteCurrentEnhanced()
+        elif choice == 2:  # Удалить все
+            self._deleteAllEnhanced()
+
+    def _deleteCurrentEnhanced(self):
+        """Удаляет улучшенное изображение текущей страницы"""
+        if self.viewer.current_page < 0 or self.viewer.current_page >= len(self.image_paths):
+            return
+
+        current_path = self.image_paths[self.viewer.current_page]
+
         # Запрашиваем подтверждение
         reply = QMessageBox.question(
-            self, "Удаление улучшенных изображений",
-            "Вы уверены, что хотите удалить все улучшенные изображения?",
+            self, "Удаление улучшенного изображения",
+            f"Вы уверены, что хотите удалить улучшенное изображение для страницы {self.viewer.current_page + 1}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Выполняем удаление
+            if delete_enhanced_image(current_path, self.enhanced_folder):
+                # Проверяем, остались ли еще улучшенные изображения
+                has_more_enhanced = check_enhanced_availability(self.image_paths, self.enhanced_folder)
+
+                if not has_more_enhanced:
+                    # Если это было последнее улучшенное изображение
+                    self.enhanced_radio.setEnabled(False)
+                    self.original_radio.setChecked(True)
+                    self.viewer.set_enhanced(False)
+                    self.show_enhanced = False
+                else:
+                    # Если текущий режим - показ улучшенных, переключаемся на оригинал для этой страницы
+                    if self.show_enhanced:
+                        self.viewer.displayCurrentPage()
+
+                # Обновляем информацию
+                self.update_project_info()
+
+                show_message(self, "Удаление выполнено",
+                             f"Улучшенное изображение для страницы {self.viewer.current_page + 1} удалено.")
+            else:
+                show_message(self, "Ошибка",
+                             "Не удалось удалить улучшенное изображение.", QMessageBox.Warning)
+
+    def _deleteAllEnhanced(self):
+        """Удаляет все улучшенные изображения"""
+        # Запрашиваем подтверждение
+        reply = QMessageBox.question(
+            self, "Удаление всех улучшенных изображений",
+            "Вы уверены, что хотите удалить ВСЕ улучшенные изображения?\n\nЭто действие необратимо!",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
 
@@ -1140,38 +1836,50 @@ class PreprocessingWindow(QDialog):
     def runEnhancement(self):
         """Запуск процесса улучшения изображений"""
         if self.is_proc:
-            show_message(self, "Предупреждение",
-                         f"Уже выполняется {self.curr_op}. Дождитесь завершения.", QMessageBox.Warning)
+            # Если процесс идет - останавливаем его
+            self.stopEnhancement()
             return
 
-        # В зависимости от текущей страницы, улучшаем одно или все изображения
+        # Проверяем наличие изображений
         current_index = self.viewer.current_page
         if current_index < 0 or current_index >= len(self.image_paths):
             show_message(self, "Предупреждение",
                          "Нет выбранного изображения для улучшения.", QMessageBox.Warning)
             return
 
-        # Получаем путь к текущему изображению
-        current_image = self.image_paths[current_index]
+        # Показываем диалог выбора
+        choice = self.showEnhancementDialog()
 
-        # Подтверждение от пользователя
-        reply = QMessageBox.question(
-            self, "Улучшение изображения",
-            f"Вы хотите улучшить только текущее изображение (страница {current_index + 1})?",
-            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes
-        )
-
-        if reply == QMessageBox.Cancel:
+        if choice == 0:  # Отмена
             return
-
-        # Если пользователь выбрал "Нет", улучшаем все изображения
-        if reply == QMessageBox.No:
+        elif choice == 1:  # Текущее изображение
+            current_image = self.image_paths[current_index]
+            self._enhanceSingleImage(current_image, current_index)
+        elif choice == 2:  # Все изображения
             self._enhanceAllImages()
-            return
 
-        # Иначе улучшаем только текущее изображение
-        self._enhanceSingleImage(current_image, current_index)
+    def stopEnhancement(self):
+        """Остановка процесса улучшения"""
+        if self.enhancement_worker:
+            reply = QMessageBox.question(
+                self, "Остановка улучшения",
+                "Вы уверены, что хотите остановить процесс улучшения изображений?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
 
+            if reply == QMessageBox.Yes:
+                logger.info("Остановка процесса улучшения по запросу пользователя...")
+                self.enhancement_worker.stop()
+
+                # Обновляем интерфейс
+                self.enh_prog.setValue(0)
+                self._createDelayedAction(500, lambda: self.enh_prog.setVisible(False))
+
+                # Разблокируем интерфейс
+                self.unlockInterface()
+                self.enhancement_worker = None
+
+                show_message(self, "Остановлено", "Процесс улучшения изображений был остановлен.")
     def _enhanceSingleImage(self, image_path, image_index):
         """Улучшение одного изображения"""
         # Блокируем интерфейс
@@ -1264,7 +1972,39 @@ class PreprocessingWindow(QDialog):
         self.update_project_info()
 
         # Скрываем прогресс-бар через 3 секунды
-        QTimer.singleShot(3000, lambda: self.enh_prog.setVisible(False))
+        self._createDelayedAction(3000, lambda: self.enh_prog.setVisible(False) if hasattr(self,
+                                                                                           'enh_prog') and self.enh_prog else None)
+
+        # Разблокируем интерфейс
+        self.unlockInterface()
+        self.enhancement_worker = None
+
+    def _onEnhFinished(self):
+        """Обработка завершения улучшения"""
+        self.enh_prog.setValue(100)
+
+        # Обновляем изображения в просмотрщике
+        self.viewer.updateImages()
+
+        # Включаем опцию "Улучшенное" и переключаемся на нее
+        self.enhanced_radio.setEnabled(True)
+        self.enhanced_radio.setChecked(True)
+        self.viewer.set_enhanced(True)
+        self.show_enhanced = True
+
+        # Статус "В работе"
+        self.status_in_prog.setChecked(True)
+        self.onStatusChanged()
+
+        # Показываем сообщение
+        show_message(self, "Готово", "Улучшение изображений завершено успешно!")
+
+        # Обновляем информацию
+        self.update_project_info()
+
+        # Скрываем прогресс-бар через 3 секунды
+        self._createDelayedAction(3000, lambda: self.enh_prog.setVisible(False) if hasattr(self,
+                                                                                           'enh_prog') and self.enh_prog else None)
 
         # Разблокируем интерфейс
         self.unlockInterface()
@@ -1342,8 +2082,15 @@ class PreprocessingWindow(QDialog):
         # Обновляем информацию
         self.update_project_info()
 
-        # Скрываем прогресс-бар через 3 секунды
-        QTimer.singleShot(3000, lambda: self.enh_prog.setVisible(False))
+        # Скрываем прогресс-бар через 3 секунды с проверкой
+        def hide_progress():
+            if hasattr(self, 'enh_prog') and self.enh_prog:
+                try:
+                    self.enh_prog.setVisible(False)
+                except RuntimeError:
+                    pass  # Объект уже удален
+
+        QTimer.singleShot(3000, hide_progress)
 
         # Разблокируем интерфейс
         self.unlockInterface()
@@ -1357,9 +2104,10 @@ class PreprocessingWindow(QDialog):
         show_message(self, "Ошибка", f"Произошла ошибка при улучшении изображений:\n{error_msg}", QMessageBox.Critical)
 
         # Скрываем прогресс-бар через 3 секунды
-        QTimer.singleShot(3000, lambda: self.enh_prog.setVisible(False))
+        self._createDelayedAction(3000, lambda: self.enh_prog.setVisible(False) if hasattr(self,
+                                                                                           'enh_prog') and self.enh_prog else None)
 
-        # Разблокируем интерфейс
+        # Разблокируем интерфейс и возвращаем кнопку в исходное состояние
         self.unlockInterface()
         self.enhancement_worker = None
 
@@ -1368,7 +2116,24 @@ class PreprocessingWindow(QDialog):
         self.is_proc = True
         self.curr_op = operation
 
-        self.enh_btn.setEnabled(False)
+        # Меняем кнопку улучшения на кнопку остановки
+        self.enh_btn.setText("Остановить улучшение")
+        self.enh_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #CC3333;
+                color: white;
+                border-radius: 8px;
+                padding: 10px 20px;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: #DD4444;
+            }
+        """)
+        # Кнопка остается активной для возможности остановки
+        self.enh_btn.setEnabled(True)
+
+        # Блокируем остальные кнопки
         self.delete_enhanced_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
 
@@ -1379,6 +2144,22 @@ class PreprocessingWindow(QDialog):
         self.is_proc = False
         self.curr_op = None
 
+        # Возвращаем кнопку улучшения в исходное состояние
+        self.enh_btn.setText("Улучшить изображения")
+        self.enh_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7E1E9F;
+                color: white;
+                border-radius: 8px;
+                padding: 10px 20px;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: #9E3EAF;
+            }
+        """)
+
+        # Разблокируем все кнопки
         self.enh_btn.setEnabled(True)
         self.delete_enhanced_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
@@ -1386,90 +2167,116 @@ class PreprocessingWindow(QDialog):
         QApplication.processEvents()
 
     def saveResult(self):
-        """Сохранение результата обработки"""
+        """Сохранение результата обработки в папку Save"""
         # Блокируем интерфейс во время операции
         self.lockInterface("Сохранение результата")
 
         try:
-            # Переносим нарезанные файлы в папку Предобработка
-            orig_folder = self.originals_folder
-            preproc_folder = self.ch_paths["preproc"]
+            # Создаем папку Save
+            save_folder = os.path.join(self.ch_paths["preproc"], "Save")
+            os.makedirs(save_folder, exist_ok=True)
+
+            # Очищаем папку Save
+            for file in os.listdir(save_folder):
+                file_path = os.path.join(save_folder, file)
+                if os.path.isfile(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception as e:
+                        logger.error(f"Ошибка при удалении файла {file_path}: {e}")
 
             # Проверяем наличие файлов
-            files = [f for f in os.listdir(orig_folder) if
-                     f.endswith(('.jpg', '.jpeg', '.png')) and os.path.isfile(os.path.join(orig_folder, f))]
+            files = [f for f in os.listdir(self.originals_folder) if
+                     f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')) and
+                     os.path.isfile(os.path.join(self.originals_folder, f))]
 
             if not files:
                 show_message(self, "Предупреждение", "Нет файлов для сохранения!")
                 return
 
-            # Определяем, какие файлы копировать (оригиналы или улучшенные)
-            use_enhanced = self.show_enhanced
+            # Подсчитываем улучшенные изображения
+            enhanced_count = 0
+            missing_enhanced = []
 
-            # Если выбраны улучшенные, проверяем их наличие
-            if use_enhanced:
-                has_all_enhanced = True
-                for f in files:
-                    base = os.path.splitext(f)[0]
-                    ext = os.path.splitext(f)[1]
-                    enh_file = f"{base}_enhanced{ext}"
-                    enh_path = os.path.join(self.enhanced_folder, enh_file)
-                    if not os.path.exists(enh_path):
-                        has_all_enhanced = False
-                        break
+            for f in files:
+                base = os.path.splitext(f)[0]
+                ext = os.path.splitext(f)[1]
+                enh_file = f"{base}_enhanced{ext}"
+                enh_path = os.path.join(self.enhanced_folder, enh_file)
 
-                if not has_all_enhanced:
-                    reply = QMessageBox.question(
-                        self, "Улучшенные изображения",
-                        "Некоторые или все улучшенные изображения отсутствуют. Копировать оригинальные?",
-                        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-                    )
-                    if reply == QMessageBox.Yes:
-                        use_enhanced = False
-                    else:
-                        self.unlockInterface()
-                        return
+                if os.path.exists(enh_path):
+                    enhanced_count += 1
+                else:
+                    missing_enhanced.append(f)
 
-            # Копируем файлы
+            # Если не все изображения улучшены - показываем предупреждение
+            if missing_enhanced:
+                message = f"Внимание! Не все изображения были улучшены.\n\n"
+                message += f"Улучшено: {enhanced_count} из {len(files)}\n"
+                message += f"Будут сохранены оригиналы для {len(missing_enhanced)} изображений."
+
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Warning)
+                msg.setWindowTitle("Не все изображения улучшены")
+                msg.setText(message)
+                msg.setStandardButtons(QMessageBox.Ok)
+                msg.exec()
+
+            # Копируем файлы согласно алгоритму
             copied_count = 0
+            errors = []
 
-            if use_enhanced:
-                # Копируем улучшенные изображения
-                for f in files:
-                    base = os.path.splitext(f)[0]
-                    ext = os.path.splitext(f)[1]
-                    enh_file = f"{base}_enhanced{ext}"
-                    src = os.path.join(self.enhanced_folder, enh_file)
-                    dst = os.path.join(preproc_folder, f)  # Сохраняем с оригинальным именем!
+            for f in files:
+                base = os.path.splitext(f)[0]
+                ext = os.path.splitext(f)[1]
 
-                    if os.path.exists(src):
-                        try:
-                            import shutil
-                            shutil.copy2(src, dst)
-                            copied_count += 1
-                        except Exception as e:
-                            logger.error(f"Ошибка при копировании улучшенного {src}: {e}")
-            else:
-                # Копируем оригинальные изображения
-                for f in files:
-                    src = os.path.join(orig_folder, f)
-                    dst = os.path.join(preproc_folder, f)
-                    try:
+                # Проверяем наличие улучшенного изображения
+                enh_file = f"{base}_enhanced{ext}"
+                enh_path = os.path.join(self.enhanced_folder, enh_file)
+
+                # Путь назначения в папке Save (без суффикса _enhanced)
+                dst_path = os.path.join(save_folder, f)
+
+                try:
+                    if os.path.exists(enh_path):
+                        # Если есть улучшенное - копируем его
                         import shutil
-                        shutil.copy2(src, dst)
-                        copied_count += 1
-                    except Exception as e:
-                        logger.error(f"Ошибка при копировании {src}: {e}")
+                        shutil.copy2(enh_path, dst_path)
+                        logger.debug(f"Скопировано улучшенное: {enh_file} -> {f}")
+                    else:
+                        # Если нет улучшенного - копируем оригинал
+                        src_path = os.path.join(self.originals_folder, f)
+                        import shutil
+                        shutil.copy2(src_path, dst_path)
+                        logger.debug(f"Скопирован оригинал: {f}")
+
+                    copied_count += 1
+
+                except Exception as e:
+                    error_msg = f"Ошибка при копировании {f}: {e}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
 
             # Статус "Завершен"
             self.status_done.setChecked(True)
             self.onStatusChanged()
 
-            show_message(
-                self, "Готово",
-                f"Результат успешно сохранен! Скопировано {copied_count} файлов " +
-                ("(улучшенные)" if use_enhanced else "(оригинальные)")
-            )
+            # Показываем результат
+            if errors:
+                error_text = "\n".join(errors[:5])  # Показываем первые 5 ошибок
+                show_message(
+                    self, "Сохранение завершено с ошибками",
+                    f"Сохранено {copied_count} из {len(files)} файлов.\n\nОшибки:\n{error_text}",
+                    QMessageBox.Warning
+                )
+            else:
+                show_message(
+                    self, "Готово",
+                    f"Результат успешно сохранен в папку Save!\n"
+                    f"Сохранено файлов: {copied_count}\n"
+                    f"Из них улучшенных: {enhanced_count}"
+                )
+
         except Exception as e:
             show_message(self, "Ошибка", f"Произошла ошибка при сохранении результата: {str(e)}", QMessageBox.Critical)
         finally:
@@ -1505,20 +2312,114 @@ class PreprocessingWindow(QDialog):
 
     def closeEvent(self, event):
         """Обработчик события закрытия окна"""
-        # Останавливаем все рабочие потоки
-        if self.enhancement_worker:
+        self._closing = True
+
+        # Отключаем все сигналы чтобы избежать вызовов после закрытия
+        try:
+            self.page_change_signal.page_changed.disconnect()
+            if hasattr(self, 'image_loader'):
+                self.image_loader.image_loaded.disconnect()
+                self.image_loader.loading_progress.disconnect()
+                self.image_loader.loading_complete.disconnect()
+        except:
+            pass
+
+        # Проверяем, идет ли процесс улучшения
+        if self.is_proc and self.enhancement_worker:
+            reply = QMessageBox.question(
+                self, "Подтверждение закрытия",
+                "В данный момент выполняется улучшение изображений.\n"
+                "Прервать процесс и закрыть окно?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.No:
+                event.ignore()
+                self._closing = False
+                return
+
+            # Останавливаем процесс
+            logger.info("Остановка процесса улучшения...")
             self.enhancement_worker.stop()
 
-        # Останавливаем таймеры
-        if hasattr(self, 'check_enhanced_timer'):
-            self.check_enhanced_timer.stop()
+            # Даем больше времени для корректного завершения
+            QApplication.processEvents()
+
+            # Ждем завершения воркера
+            if hasattr(self, 'q_thread_pool'):
+                self.q_thread_pool.waitForDone(2000)  # Ждем до 2 секунд
+
+        # Выполняем закрытие
+        self._performClose()
+        event.accept()
+
+    def _performClose(self):
+        """Выполнение закрытия окна"""
+        self._closing = True
+
+        # Останавливаем все активные таймеры
+        for timer in self.active_timers[:]:
+            try:
+                if timer and hasattr(timer, 'stop'):
+                    timer.stop()
+                    timer.deleteLater()
+            except RuntimeError:
+                pass
+        self.active_timers.clear()
+
+
+        # Останавливаем check_enhanced_timer
+        if hasattr(self, 'check_enhanced_timer') and self.check_enhanced_timer:
+            try:
+                self.check_enhanced_timer.stop()
+                self.check_enhanced_timer.deleteLater()
+            except RuntimeError:
+                pass
 
         # Отменяем загрузку изображений
-        if hasattr(self, 'image_loader'):
+        if hasattr(self, 'image_loader') and self.image_loader:
             self.image_loader.cancel()
+            QApplication.processEvents()
 
-        # Закрываем пул потоков
-        if hasattr(self, 'thread_pool'):
-            self.thread_pool.shutdown(wait=False)
+        # Закрываем пул потоков с ожиданием
+        if hasattr(self, 'thread_pool') and self.thread_pool:
+            try:
+                import sys
+                if sys.version_info >= (3, 9):
+                    self.thread_pool.shutdown(wait=True, cancel_futures=True)
+                else:
+                    self.thread_pool.shutdown(wait=True)
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии thread_pool: {e}")
+                self.thread_pool.shutdown(wait=True)
 
-        super().closeEvent(event)
+        # Очищаем QThreadPool
+        if hasattr(self, 'q_thread_pool'):
+            self.q_thread_pool.clear()
+            self.q_thread_pool.waitForDone(1000)
+
+        # Очищаем GPU ресурсы
+        self._cleanup_gpu_resources()
+
+        # Очищаем ссылки
+        self.enhancement_worker = None
+
+        # Удаляем временные виджеты
+        for attr in ['loading_overlay', 'overlay_widget']:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget:
+                    try:
+                        widget.close()
+                        widget.deleteLater()
+                    except:
+                        pass
+                    setattr(self, attr, None)
+
+        # Очищаем эффекты
+        if hasattr(self, 'bg_widget') and self.bg_widget:
+            self.bg_widget.setGraphicsEffect(None)
+
+        if hasattr(self, 'blur_effect'):
+            self.blur_effect = None

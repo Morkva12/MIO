@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import Qt, Signal, QObject, QEvent, QPointF
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                               QPushButton, QProgressBar, QGraphicsProxyWidget)
+                               QPushButton, QProgressBar, QGraphicsProxyWidget,QGroupBox)
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import QApplication
 
@@ -131,30 +131,41 @@ class ImageLoader(QObject):
                 futures.append(future)
 
                 # Небольшая задержка чтобы не блокировать GUI
-                time.sleep(0.05)
+                time.sleep(0.01)  # Уменьшить с 0.05 до 0.01
 
             # Обрабатываем результаты по мере их завершения
             for future in as_completed(futures):
                 if self.cancel_loading:
+                    # Отменяем оставшиеся futures
+                    for f in futures:
+                        f.cancel()
                     break
 
-                result = future.result()
-                if result and result[0] is not None:
-                    pixmap, idx, current_file = result
-                    self.image_loaded.emit(idx, pixmap, current_file)
-                    self.loaded_count += 1
-                    self.loading_progress.emit(self.loaded_count, self.total_count, current_file)
+                try:
+                    result = future.result(timeout=1.0)  # Добавить таймаут
+                    if result and result[0] is not None:
+                        pixmap, idx, current_file = result
+                        # Проверяем, что приложение еще работает
+                        if QApplication.instance():
+                            self.image_loaded.emit(idx, pixmap, current_file)
+                            self.loaded_count += 1
+                            self.loading_progress.emit(self.loaded_count, self.total_count, current_file)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении результата: {e}")
 
-            # Сигнализируем о завершении загрузки, если не было отмены
-            if not self.cancel_loading:
+            # Сигнализируем о завершении загрузки
+            if not self.cancel_loading and QApplication.instance():
                 self.loading_complete.emit()
-                QApplication.postEvent(QApplication.instance().activeWindow(), AllImagesLoadedEvent())
+                active_window = QApplication.instance().activeWindow()
+                if active_window:
+                    QApplication.postEvent(active_window, AllImagesLoadedEvent())
             else:
                 self.loading_cancelled.emit()
 
         except Exception as e:
             logger.error(f"Ошибка в процессе загрузки: {str(e)}")
-            self.loading_cancelled.emit()
+            if not self.cancel_loading:
+                self.loading_cancelled.emit()
 
     def cancel(self):
         """Отмена загрузки изображений"""
@@ -310,3 +321,266 @@ class LoadingOverlay(QWidget):
                 parent_rect.width() // 2 - self.width() // 2,
                 parent_rect.height() // 2 - self.height() // 2
             )
+
+
+class SyncDialog(QWidget):
+    """Диалог синхронизации при изменении файлов"""
+
+    def __init__(self, changes, parent=None):
+        super().__init__(parent)
+        logger.info("=== SyncDialog.__init__ НАЧАЛО ===")
+
+        self.changes = changes
+        self.selected_mode = 'none'
+        self._event_loop = None
+
+        logger.info(f"Инициализация с изменениями: {changes}")
+        logger.info(f"Родительское окно: {parent}")
+
+        self.setWindowTitle("Обнаружены изменения в папке")
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #2D2D3A;
+                color: white;
+            }
+        """)
+
+        self.setFixedWidth(600)
+        logger.info("Настройка UI...")
+        self._setupUI()
+        logger.info("=== SyncDialog.__init__ КОНЕЦ ===")
+
+    def _setupUI(self):
+        """Настройка интерфейса диалога"""
+        logger.info("_setupUI: начало настройки интерфейса")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        # Заголовок
+        title = QLabel("Обнаружены изменения в папке изображений")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #A490FF;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # Информация об изменениях
+        info_text = self._get_changes_text()
+        logger.info(f"_setupUI: текст изменений: {info_text}")
+
+        info_label = QLabel(info_text)
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("""
+            background-color: #1E1E2A;
+            border: 1px solid #7E1E9F;
+            border-radius: 8px;
+            padding: 15px;
+            color: #E0E0E0;
+        """)
+        layout.addWidget(info_label)
+
+        # Варианты действий
+        actions_group = QGroupBox("Выберите действие:")
+        actions_group.setStyleSheet("""
+            QGroupBox {
+                border: 2px solid #7E1E9F;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+        """)
+
+        actions_layout = QVBoxLayout()
+
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup
+
+        self.action_group = QButtonGroup(self)
+
+        # Вариант 1: Ничего не делать
+        self.radio_none = QRadioButton("Ничего не делать")
+        self.radio_none.setStyleSheet("padding: 5px;")
+        self.radio_none.setChecked(True)
+        logger.info("_setupUI: создана радиокнопка 'Ничего не делать'")
+
+        none_desc = QLabel("Изменения будут проигнорированы. Улучшенные изображения останутся без изменений.")
+        none_desc.setWordWrap(True)
+        none_desc.setStyleSheet("color: #B0B0B0; margin-left: 25px; margin-bottom: 10px;")
+
+        # Вариант 2: Синхронизировать с удалением
+        self.radio_delete = QRadioButton("Синхронизировать с удалением улучшенных")
+        self.radio_delete.setStyleSheet("padding: 5px;")
+        logger.info("_setupUI: создана радиокнопка 'Удалить'")
+
+        delete_desc = QLabel("Все улучшенные изображения будут удалены. Потребуется повторное улучшение.")
+        delete_desc.setWordWrap(True)
+        delete_desc.setStyleSheet("color: #FFB0B0; margin-left: 25px; margin-bottom: 10px;")
+
+        # Вариант 3: Синхронизировать с сохранением
+        self.radio_preserve = QRadioButton("Синхронизировать с попыткой сохранения улучшенных")
+        self.radio_preserve.setStyleSheet("padding: 5px;")
+        logger.info("_setupUI: создана радиокнопка 'Сохранить'")
+
+        preserve_desc = QLabel(
+            "Система попытается сохранить улучшенные изображения, переименовав их в соответствии с новыми именами оригиналов.")
+        preserve_desc.setWordWrap(True)
+        preserve_desc.setStyleSheet("color: #B0FFB0; margin-left: 25px; margin-bottom: 10px;")
+
+        self.action_group.addButton(self.radio_none)
+        self.action_group.addButton(self.radio_delete)
+        self.action_group.addButton(self.radio_preserve)
+
+        actions_layout.addWidget(self.radio_none)
+        actions_layout.addWidget(none_desc)
+        actions_layout.addWidget(self.radio_delete)
+        actions_layout.addWidget(delete_desc)
+        actions_layout.addWidget(self.radio_preserve)
+        actions_layout.addWidget(preserve_desc)
+
+        actions_group.setLayout(actions_layout)
+        layout.addWidget(actions_group)
+
+        # Кнопки
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(10)
+
+        self.cancel_btn = QPushButton("Отмена")
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #777;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.reject)
+        logger.info("_setupUI: создана кнопка 'Отмена'")
+
+        self.apply_btn = QPushButton("Применить")
+        self.apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7E1E9F;
+                color: white;
+                border-radius: 8px;
+                padding: 8px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #9E3EAF;
+            }
+        """)
+        self.apply_btn.clicked.connect(self.accept)
+        logger.info("_setupUI: создана кнопка 'Применить'")
+
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.cancel_btn)
+        buttons_layout.addWidget(self.apply_btn)
+
+        layout.addLayout(buttons_layout)
+        layout.addStretch()
+
+        logger.info("_setupUI: интерфейс настроен")
+
+    def _get_changes_text(self):
+        """Формирует текст с описанием изменений"""
+        lines = []
+
+        if self.changes.get('added'):
+            lines.append(f"• Добавлено файлов: {len(self.changes['added'])}")
+
+        if self.changes.get('removed'):
+            lines.append(f"• Удалено файлов: {len(self.changes['removed'])}")
+
+        if self.changes.get('modified'):
+            lines.append(f"• Изменено файлов: {len(self.changes['modified'])}")
+
+        if self.changes.get('renamed'):
+            lines.append(f"• Переименовано файлов: {len(self.changes['renamed'])}")
+
+        if self.changes.get('reordered'):
+            lines.append("• Изменен порядок файлов")
+
+        if not lines:
+            lines.append("Изменения не обнаружены")
+
+        return "\n".join(lines)
+
+    def accept(self):
+        """Применение выбранного действия"""
+        logger.info("=== SyncDialog.accept ВЫЗВАН ===")
+
+        if self.radio_none.isChecked():
+            self.selected_mode = 'none'
+            logger.info("Выбран режим: NONE")
+        elif self.radio_delete.isChecked():
+            self.selected_mode = 'delete'
+            logger.info("Выбран режим: DELETE")
+        elif self.radio_preserve.isChecked():
+            self.selected_mode = 'preserve'
+            logger.info("Выбран режим: PRESERVE")
+
+        logger.info(f"Установлен selected_mode = '{self.selected_mode}'")
+        logger.info("Закрытие окна...")
+        self.close()
+
+        if self._event_loop:
+            logger.info("Остановка event loop...")
+            self._event_loop.quit()
+        else:
+            logger.warning("event_loop не существует!")
+
+        logger.info("=== SyncDialog.accept ЗАВЕРШЕН ===")
+
+    def reject(self):
+        """Отмена диалога"""
+        logger.info("=== SyncDialog.reject ВЫЗВАН ===")
+
+        self.selected_mode = 'cancel'
+        logger.info(f"Установлен selected_mode = 'cancel'")
+        logger.info("Закрытие окна...")
+        self.close()
+
+        if self._event_loop:
+            logger.info("Остановка event loop...")
+            self._event_loop.quit()
+        else:
+            logger.warning("event_loop не существует!")
+
+        logger.info("=== SyncDialog.reject ЗАВЕРШЕН ===")
+
+    def exec(self):
+        """Показ диалога и возврат выбранного режима"""
+        logger.info("=== SyncDialog.exec НАЧАЛО ===")
+        logger.info("Показ окна...")
+        self.show()
+
+        from PySide6.QtCore import QEventLoop
+        self._event_loop = QEventLoop()
+        logger.info("QEventLoop создан")
+
+        # Центрируем диалог
+        if self.parent():
+            parent_rect = self.parent().geometry()
+            x = parent_rect.x() + (parent_rect.width() - self.width()) // 2
+            y = parent_rect.y() + (parent_rect.height() - self.height()) // 2
+            logger.info(f"Центрирование окна: x={x}, y={y}")
+            self.move(x, y)
+
+        logger.info("Запуск event loop...")
+        self._event_loop.exec()
+        logger.info("Event loop завершен")
+
+        logger.info(f"Возвращаемое значение: '{self.selected_mode}'")
+        logger.info("=== SyncDialog.exec КОНЕЦ ===")
+
+        return self.selected_mode

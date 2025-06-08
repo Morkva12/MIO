@@ -25,6 +25,228 @@ from ui.components.gradient_widget import GradientBackgroundWidget
 from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtCore import QRegularExpression
 
+class EditChapterDialog(QDialog):
+    def __init__(self, callback, current_chapter_number, existing_chapters, parent=None):
+        """
+        Инициализация диалога редактирования главы.
+
+        :param callback: Функция обратного вызова для передачи нового номера главы.
+        :param current_chapter_number: Текущий номер главы для предзаполнения.
+        :param existing_chapters: Список существующих номеров глав для проверки дубликатов.
+        :param parent: Родительский виджет.
+        """
+        super().__init__(parent)
+        self.callback = callback
+        self.current_chapter_number = current_chapter_number
+        self.existing_chapters = existing_chapters
+        self.drag_pos = None
+
+        # Настройка свойств диалога
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(400, 180)  # Фиксированный размер диалога
+
+        self._initUI()
+
+    def _initUI(self):
+        # Основной контейнер с закругленными углами
+        main_widget = QWidget(self)
+        main_widget.setObjectName("main_widget")
+        main_widget.setStyleSheet("""
+            #main_widget {
+                background-color: #3E3E5F;  /* Цвет фона основного окна программы */
+                border-radius: 15px;
+            }
+        """)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Заголовок с названием и кнопкой закрытия
+        header = QWidget(main_widget)
+
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(15, 10, 15, 10)
+
+        title = QLabel("Редактировать главу", header)
+        title.setStyleSheet("color: white; font-size: 16px; font-weight: bold;")
+        title.setAlignment(Qt.AlignCenter)  # Центрирование заголовка
+        header_layout.addWidget(title)
+
+        # Пробел для выталкивания кнопки закрытия вправо
+        header_layout.addSpacerItem(QSpacerItem(40, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+
+        close_btn = QPushButton("✕", header)
+        close_btn.setFixedSize(30, 30)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                color: white;
+                background: transparent;
+                border: none;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                color: #FF5C5C;
+            }
+        """)
+        close_btn.clicked.connect(self.reject)
+        header_layout.addWidget(close_btn)
+
+        main_layout.addWidget(header)
+
+        # Область контента с полем ввода
+        content = QWidget(main_widget)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(20, 15, 20, 15)
+        content_layout.setSpacing(10)
+
+        self.input_edit = QLineEdit(content)
+        self.input_edit.setPlaceholderText("Номер главы")
+        self.input_edit.setText(self.current_chapter_number)  # Предзаполняем текущим номером
+        self.input_edit.setObjectName("input_edit")
+        self.input_edit.setStyleSheet("""
+            QLineEdit#input_edit {
+                background-color: #2E2E4F;  /* Цвет фона поля ввода */
+                color: white;
+                border: 2px solid #4E4E6F;  /* Цвет границы поля ввода */
+                border-radius: 8px;
+                padding: 10px 10px;  /* Сокращены горизонтальные отступы для полного отображения подсказки */
+                font-size: 14px;
+            }
+            QLineEdit#input_edit:focus {
+                border: 2px solid #7289DA;  /* Цвет границы при фокусе */
+                background-color: #3E3E5F;
+            }
+        """)
+        # Установка валидатора для разрешения только цифр и точек
+        validator = QRegularExpressionValidator(QRegularExpression("^[0-9\\.]+$"), self.input_edit)
+        self.input_edit.setValidator(validator)
+        content_layout.addWidget(self.input_edit)
+
+        main_layout.addWidget(content)
+
+        # Нижний колонтитул с кнопками Отмена и Сохранить
+        footer = QWidget(main_widget)
+        footer.setObjectName("footer")
+
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(20, 10, 20, 10)
+
+        cancel_btn = QPushButton("Отмена", footer)
+        cancel_btn.setFixedHeight(35)
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;  /* Прозрачный фон для кнопки Отмена */
+                color: white;
+                border: 2px solid #727D8C;  /* Цвет границы кнопки */
+                border-radius: 8px;
+                padding: 5px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #5A6A82;
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        footer_layout.addWidget(cancel_btn)
+
+        self.save_btn = QPushButton("Сохранить", footer)
+        self.save_btn.setFixedHeight(35)
+        self.save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7E1E9F;  /* Цвет фона кнопки Сохранить */
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 5px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #8E2EBF;
+            }
+        """)
+        self.save_btn.clicked.connect(self.onSaveClicked)
+        footer_layout.addWidget(self.save_btn)
+
+        main_layout.addWidget(footer)
+
+    def showEvent(self, event):
+        """
+        Переопределение метода showEvent для позиционирования диалога по центру родительского окна
+        и установки фокуса на поле ввода.
+        """
+        super().showEvent(event)
+        if self.parent():
+            parent_geometry = self.parent().frameGeometry()
+            parent_center = parent_geometry.center()
+            self_geometry = self.frameGeometry()
+            self_geometry.moveCenter(parent_center)
+            self.move(self_geometry.topLeft())
+        self.input_edit.setFocus()  # Установка фокуса на поле ввода при открытии
+        self.input_edit.selectAll()  # Выделяем весь текст для удобства редактирования
+
+    def mousePressEvent(self, event):
+        """
+        Обработка события нажатия мыши для реализации перетаскивания диалога.
+        """
+        if event.button() == Qt.LeftButton:
+            self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """
+        Обработка события перемещения мыши для перетаскивания диалога.
+        """
+        if event.buttons() & Qt.LeftButton and self.drag_pos:
+            new_pos = event.globalPosition().toPoint() - self.drag_pos
+            # Получение геометрии доступного экрана
+            screen_geometry = self.screen().availableGeometry()
+            window_geometry = self.frameGeometry()
+
+            # Вычисление новой позиции с учётом границ экрана
+            new_x = max(screen_geometry.left(), min(new_pos.x(), screen_geometry.right() - window_geometry.width()))
+            new_y = max(screen_geometry.top(), min(new_pos.y(), screen_geometry.bottom() - window_geometry.height()))
+            self.move(new_x, new_y)
+            event.accept()
+        super().mouseMoveEvent(event)
+
+    def keyPressEvent(self, event):
+        """
+        Переопределение метода keyPressEvent для обработки нажатий клавиш Enter и Escape.
+        """
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            # Если нажата клавиша Enter, вызвать метод сохранения
+            self.onSaveClicked()
+            event.accept()
+        elif event.key() == Qt.Key_Escape:
+            # Если нажата клавиша Escape, закрыть диалог как отмену
+            self.reject()
+            event.accept()
+        else:
+            # Для остальных клавиш вызвать стандартную обработку
+            super().keyPressEvent(event)
+
+    def onSaveClicked(self):
+        """Обработчик нажатия на кнопку "Сохранить"."""
+        new_number = self.input_edit.text().strip()
+        if not new_number:
+            QMessageBox.warning(self, "Ошибка", "Номер главы не может быть пустым.", QMessageBox.Ok)
+            return
+
+        # Если номер не изменился, просто закрываем диалог
+        if new_number == self.current_chapter_number:
+            self.accept()
+            return
+
+        # Проверка на существование главы с таким же номером
+        if new_number in self.existing_chapters:
+            QMessageBox.warning(self, "Ошибка", f"Глава с номером '{new_number}' уже существует.", QMessageBox.Ok)
+            return
+
+        if self.callback:
+            self.callback(new_number)
+        self.accept()
 
 class AddChapterDialog(QDialog):
     def __init__(self, callback, existing_chapters, parent=None):
@@ -225,10 +447,7 @@ class AddChapterDialog(QDialog):
             super().keyPressEvent(event)
 
     def onCreateClicked(self):
-        """
-        Обработчик нажатия на кнопку "Создать". Проверяет ввод и передаёт данные через callback.
-        Также проверяет наличие главы с таким номером.
-        """
+        """Обработчик нажатия на кнопку "Создать"."""
         text = self.input_edit.text().strip()
         if not text:
             QMessageBox.warning(self, "Ошибка", "Номер главы не может быть пустым.", QMessageBox.Ok)
@@ -247,9 +466,9 @@ class AddChapterDialog(QDialog):
                 "Предобработка": False,
                 "Клининг": False,
                 "Перевод": False,
-                "Редактирование": False,
+                # "Редактирование": False,  # Удалено по требованию
                 "Тайпсеттинг": False,
-                "QC": False
+                "Контроль качества": False
             }
         }
         if self.callback:
@@ -842,6 +1061,7 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
     # ниже — кнопки этапов (прозрачная подложка)
     # -----------------------------------------------------------------------
     def drawChapter(self, ch_data):
+        """Отрисовка элемента главы с кнопками этапов работы"""
         f = QFrame()
         f.setStyleSheet("""
             QFrame {
@@ -886,12 +1106,29 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
                 border-radius: 8px;
             }
         """)
+
+        # Получаем этапы и фильтруем "Редактирование"
         st = ch_data.get("stages", {})
         if isinstance(st, dict):
-            done = sum(1 for v in st.values() if v is True)
-            total = len(st)
-            val = int(done / total * 100) if total else 0
+            # Создаем копию словаря без этапа "Редактирование"
+            st = {k: v for k, v in st.items() if k != "Редактирование"}
+
+            # Обновляем значение в данных главы (это важно для сохранения)
+            updated_stages = ch_data.get("stages", {}).copy()
+            if "Редактирование" in updated_stages:
+                del updated_stages["Редактирование"]
+            ch_data["stages"] = updated_stages
+
+            # Рассчитываем прогресс
+            # Если этап "Контроль качества" завершен, то прогресс 100%
+            if st.get("Контроль качества") is True:
+                val = 100
+            else:
+                done = sum(1 for v in st.values() if v is True)
+                total = len(st)
+                val = int(done / total * 100) if total else 0
             pbar.setValue(val)
+
         top_line.addWidget(pbar, 1)
 
         # Кнопка "Показать этапы" (справа)
@@ -908,7 +1145,6 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
                 background: #5E5E7F;
             }
         """)
-        # Выравниваем вправо
         top_line.addWidget(toggle_btn, 0, Qt.AlignRight)
 
         flay.addLayout(top_line)
@@ -919,14 +1155,33 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         st_lay.setContentsMargins(0, 0, 0, 0)
         st_lay.setSpacing(5)
 
+        # Проверяем, выполнен ли этап "Загрузка"
+        is_upload_done = st.get("Загрузка", False) is True
+
         for stage_name, stage_value in st.items():
             st_btn = QPushButton(stage_name)
 
-            # Проверим, что за статус у этапа:
-            # - True => завершён (зелёный)
-            # - "partial" => частичный (оранжевый)
-            # - False или любое иное => не выполнен (фиолетовый)
-            if stage_value is True:
+            # Определяем доступность этапа
+            is_enabled = stage_name == "Загрузка" or is_upload_done
+
+            # Устанавливаем стиль в зависимости от статуса и доступности
+            if not is_enabled:
+                # Недоступная кнопка (полупрозрачная)
+                st_btn.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(78, 78, 111, 0.5);  /* Полупрозрачный фиолетовый */
+                        color: rgba(255, 255, 255, 0.5);
+                        border-radius: 5px;
+                        padding: 4px 8px;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover {
+                        background: rgba(78, 78, 111, 0.6);
+                        cursor: not-allowed;
+                    }
+                """)
+                st_btn.setCursor(Qt.ForbiddenCursor)
+            elif stage_value is True:
                 # зелёная кнопка
                 st_btn.setStyleSheet("""
                     QPushButton {
@@ -955,7 +1210,7 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
                     }
                 """)
             else:
-                # фиолетовая (как было по умолчанию)
+                # фиолетовая (по умолчанию)
                 st_btn.setStyleSheet("""
                     QPushButton {
                         background: #4E4E6F;
@@ -969,11 +1224,11 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
                     }
                 """)
 
-            # Подключаем сигнал
+            # Привязываем обработчик
             st_btn.clicked.connect(lambda checked, s=stage_name, cd=ch_data: self.onStageClicked(cd, s))
             st_lay.addWidget(st_btn)
 
-        stages_wid.setStyleSheet("background: transparent;")  # прозрачная подложка
+        stages_wid.setStyleSheet("background: transparent;")
         stages_wid.setVisible(False)
         flay.addWidget(stages_wid)
 
@@ -985,11 +1240,13 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
 
         toggle_btn.clicked.connect(onToggle)
 
-        # Контекстное меню (правый клик)
+        # Контекстное меню
         f.setContextMenuPolicy(Qt.CustomContextMenu)
         f.customContextMenuRequested.connect(lambda pos, data_=ch_data, w=f: self.onChapterContext(pos, data_, w))
 
         self.chapters_container_layout.addWidget(f)
+
+
 
     # -----------------------------------------------------------------------
     # События и функционал для работы с модальным окном UploadWindow
@@ -1016,11 +1273,38 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         from ui.windows.m5_0_upload_images import UploadWindow
         self.upload_window = UploadWindow(chapter_path=chapter_folder, stage_folder=stage_folder, parent=self)
 
+        # Сохраняем информацию для обновления статуса после закрытия
+        self._pending_chapter_folder = chapter_folder
+        self._pending_stage_name = stage_folder
+
         # Центрируем окно
         self._centerChildWindow(self.upload_window)
         self.upload_window.show()
         self.upload_window.finished.connect(self._onUploadWindowFinished)
 
+    def _updateStageStatus(self, chapter_folder, stage_name, status):
+        """Обновляет статус этапа в данных главы"""
+        # Находим данные главы
+        for ch_data in self.all_chapters:
+            if ch_data.get("_folder") == chapter_folder:
+                # Обновляем статус
+                st = ch_data.get("stages", {})
+                st[stage_name] = status
+                ch_data["stages"] = st
+
+                # Сохраняем в файл
+                cjson = os.path.join(chapter_folder, "chapter.json")
+                try:
+                    with open(cjson, "w", encoding="utf-8") as f:
+                        # Создаем копию без служебного поля _folder
+                        save_data = {k: v for k, v in ch_data.items() if k != "_folder"}
+                        json.dump(save_data, f, ensure_ascii=False, indent=4)
+                except Exception as e:
+                    print(f"Не удалось сохранить статус этапа: {e}")
+
+                # Обновляем интерфейс
+                self.applySortAndFilter()
+                break
     def _centerChildWindow(self, window):
         """Центрирование дочернего окна относительно родителя"""
         if not window:
@@ -1039,6 +1323,44 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
 
     def _onUploadWindowFinished(self):
         """Обработчик закрытия окна загрузки"""
+        # Проверяем наличие изображений и обновляем статус
+        if hasattr(self, '_pending_chapter_folder') and hasattr(self, '_pending_stage_name'):
+            chapter_folder = self._pending_chapter_folder
+            stage_name = self._pending_stage_name
+
+            # Проверяем наличие изображений
+            images_json = os.path.join(chapter_folder, stage_name, "images.json")
+            has_images = False
+            if os.path.isfile(images_json):
+                try:
+                    with open(images_json, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if data:  # если список не пуст
+                        has_images = True
+                except Exception as e:
+                    print(f"Ошибка чтения images.json: {e}")
+
+            # Обновляем статус этапа
+            for ch_data in self.all_chapters:
+                if ch_data.get("_folder") == chapter_folder:
+                    st = ch_data.get("stages", {})
+                    st[stage_name] = has_images
+                    ch_data["stages"] = st
+
+                    # Сохраняем в файл
+                    cjson = os.path.join(chapter_folder, "chapter.json")
+                    try:
+                        with open(cjson, "w", encoding="utf-8") as f:
+                            save_data = {k: v for k, v in ch_data.items() if k != "_folder"}
+                            json.dump(save_data, f, ensure_ascii=False, indent=4)
+                    except Exception as e:
+                        print(f"Не удалось сохранить статус этапа: {e}")
+                    break
+
+            # Очищаем временные атрибуты
+            delattr(self, '_pending_chapter_folder')
+            delattr(self, '_pending_stage_name')
+
         # Удаляем оверлей
         if self.overlay:
             self.overlay.deleteLater()
@@ -1048,7 +1370,7 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         self.setGraphicsEffect(None)
         self.blur_effect = None
 
-        # Обновляем данные главы после загрузки
+        # Обновляем данные (статусы глав могли измениться)
         self.loadChapters()
         self.applySortAndFilter()
 
@@ -1080,6 +1402,19 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         if not chapter_folder or not os.path.isdir(chapter_folder):
             QMessageBox.warning(self, "Ошибка", "Не найдена папка главы.", QMessageBox.Ok)
             return
+
+        # Проверяем, выполнен ли этап "Загрузка" для всех этапов кроме самой "Загрузки"
+        if stage_name != "Загрузка":
+            stages = ch_data.get("stages", {})
+            if not stages.get("Загрузка", False):
+                QMessageBox.warning(
+                    self,
+                    "Недоступно",
+                    f"Этап '{stage_name}' недоступен.\n\n"
+                    "Сначала необходимо загрузить изображения в этапе 'Загрузка'.",
+                    QMessageBox.Ok
+                )
+                return
 
         if stage_name == "Загрузка":
             # Открываем окно загрузки с затемнением и размытием
@@ -1140,49 +1475,117 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
             # Подключаем сигнал закрытия
             self.cleaning_window.back_requested.connect(self._closeCleaningWindow)
 
-
         elif stage_name == "Предобработка":
-
             # Сохраняем текущее состояние UI
-
             self._saved_ui_state = {
-
                 'visible': self.isVisible()
-
             }
 
             # Скрываем текущий интерфейс
-
             self.hide()
 
             # Создаем окно предобработки
-
             from .m6_0_preprocess_images import PreprocessingWindow
-
             self.preproc_window = PreprocessingWindow(chapter_folder=chapter_folder, paths=self.paths,
                                                       parent=self.parent())
 
             # Размещаем окно предобработки на месте прежнего интерфейса
-
             layout = QVBoxLayout()
-
             layout.setContentsMargins(0, 0, 0, 0)
-
             layout.addWidget(self.preproc_window)
 
             # Создаем временный контейнер
-
             self.preproc_container = QWidget(self.parent())
-
             self.preproc_container.setLayout(layout)
-
             self.preproc_container.setGeometry(self.parent().rect())
-
             self.preproc_container.show()
 
             # Подключаем сигнал закрытия
-
             self.preproc_window.back_requested.connect(self._closePreprocessingWindow)
+
+        elif stage_name == "Перевод":
+            # Сохраняем текущее состояние UI
+            self._saved_ui_state = {
+                'visible': self.isVisible()
+            }
+
+            # Скрываем текущий интерфейс
+            self.hide()
+
+            # Создаем окно перевода
+            from ui.windows.m7_0_translation import TranslationWindow
+            self.translation_window = TranslationWindow(chapter_folder=chapter_folder, paths=self.paths,
+                                                        parent=self.parent())
+
+            # Размещаем окно перевода на месте прежнего интерфейса
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(self.translation_window)
+
+            # Создаем временный контейнер
+            self.translation_container = QWidget(self.parent())
+            self.translation_container.setLayout(layout)
+            self.translation_container.setGeometry(self.parent().rect())
+            self.translation_container.show()
+
+            # Подключаем сигнал закрытия
+            self.translation_window.back_requested.connect(self._closeTranslationWindow)
+
+        elif stage_name == "Тайпсеттинг":
+            # Сохраняем текущее состояние UI
+            self._saved_ui_state = {
+                'visible': self.isVisible()
+            }
+
+            # Скрываем текущий интерфейс
+            self.hide()
+
+            # Создаем окно тайпсеттинга
+            from ui.windows.m9_0_typesetting import TypesettingWindow
+            self.typesetting_window = TypesettingWindow(chapter_folder=chapter_folder, paths=self.paths,
+                                                        parent=self.parent())
+
+            # Размещаем окно тайпсеттинга на месте прежнего интерфейса
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(self.typesetting_window)
+
+            # Создаем временный контейнер
+            self.typesetting_container = QWidget(self.parent())
+            self.typesetting_container.setLayout(layout)
+            self.typesetting_container.setGeometry(self.parent().rect())
+            self.typesetting_container.show()
+
+            # Подключаем сигнал закрытия
+            self.typesetting_window.back_requested.connect(self._closeTypesettingWindow)
+
+        elif stage_name == "Контроль качества":
+            # Сохраняем текущее состояние UI
+            self._saved_ui_state = {
+                'visible': self.isVisible()
+            }
+
+            # Скрываем текущий интерфейс
+            self.hide()
+
+            # Создаем окно контроля качества
+            from ui.windows.m10_0_quality_check import QualityCheckWindow
+            self.quality_check_window = QualityCheckWindow(chapter_folder=chapter_folder, paths=self.paths,
+                                                           parent=self.parent())
+
+            # Размещаем окно контроля качества на месте прежнего интерфейса
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(self.quality_check_window)
+
+            # Создаем временный контейнер
+            self.quality_check_container = QWidget(self.parent())
+            self.quality_check_container.setLayout(layout)
+            self.quality_check_container.setGeometry(self.parent().rect())
+            self.quality_check_container.show()
+
+            # Подключаем сигнал закрытия
+            self.quality_check_window.back_requested.connect(self._closeQualityCheckWindow)
 
         else:
             # Остальные этапы: запрашиваем новый статус через диалог
@@ -1220,6 +1623,41 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
 
             self.applySortAndFilter()
 
+    def _closeTypesettingWindow(self):
+        """Закрывает окно тайпсеттинга и возвращает исходный интерфейс"""
+        # Удаляем окно тайпсеттинга и его контейнер
+        if hasattr(self, 'typesetting_container') and self.typesetting_container:
+            self.typesetting_container.deleteLater()
+            self.typesetting_container = None
+
+        # Восстанавливаем видимость исходного интерфейса
+        if hasattr(self, '_saved_ui_state'):
+            if self._saved_ui_state.get('visible', True):
+                self.show()
+        else:
+            self.show()
+
+        # Обновляем данные (статусы глав могли измениться)
+        self.loadChapters()
+        self.applySortAndFilter()
+
+    def _closeQualityCheckWindow(self):
+        """Закрывает окно контроля качества и возвращает исходный интерфейс"""
+        # Удаляем окно контроля качества и его контейнер
+        if hasattr(self, 'quality_check_container') and self.quality_check_container:
+            self.quality_check_container.deleteLater()
+            self.quality_check_container = None
+
+        # Восстанавливаем видимость исходного интерфейса
+        if hasattr(self, '_saved_ui_state'):
+            if self._saved_ui_state.get('visible', True):
+                self.show()
+        else:
+            self.show()
+
+        # Обновляем данные (статусы глав могли измениться)
+        self.loadChapters()
+        self.applySortAndFilter()
     def _closePreprocessingWindow(self):
         """Закрывает окно предобработки и возвращает исходный интерфейс"""
         # Удаляем окно предобработки и его контейнер
@@ -1243,6 +1681,24 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         if hasattr(self, 'cleaning_container') and self.cleaning_container:
             self.cleaning_container.deleteLater()
             self.cleaning_container = None
+
+        # Восстанавливаем видимость исходного интерфейса
+        if hasattr(self, '_saved_ui_state'):
+            if self._saved_ui_state.get('visible', True):
+                self.show()
+        else:
+            self.show()
+
+        # Обновляем данные (статусы глав могли измениться)
+        self.loadChapters()
+        self.applySortAndFilter()
+
+    def _closeTranslationWindow(self):
+        """Закрывает окно перевода и возвращает исходный интерфейс"""
+        # Удаляем окно перевода и его контейнер
+        if hasattr(self, 'translation_container') and self.translation_container:
+            self.translation_container.deleteLater()
+            self.translation_container = None
 
         # Восстанавливаем видимость исходного интерфейса
         if hasattr(self, '_saved_ui_state'):
@@ -1284,17 +1740,137 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         print("Экспорт главы:", ch_data.get("chapter_number"))
 
     def onEditChapter(self, ch_data):
-        print("Редактирование главы:", ch_data.get("chapter_number"))
+        """Открытие диалога редактирования главы"""
+        current_number = ch_data.get("chapter_number", "")
+
+        # Получаем список существующих номеров глав (исключая текущую)
+        existing_chapter_numbers = [ch.get("chapter_number", "") for ch in self.all_chapters
+                                    if ch.get("chapter_number", "") != current_number]
+
+        # Открываем диалог редактирования
+        dlg = EditChapterDialog(
+            callback=lambda new_number: self.renameChapter(ch_data, new_number),
+            current_chapter_number=current_number,
+            existing_chapters=existing_chapter_numbers,
+            parent=self
+        )
+        dlg.exec()
 
     def onEditProject(self):
-        print("Нажата кнопка 'Редактировать' (информацию о произведении).")
-        project_path = self.project_path
-        if not os.path.exists(project_path):
-            print(f"[ERROR] Путь к проекту не существует: '{project_path}'")
+        """Открытие окна редактирования проекта с эффектом размытия фона"""
+        # Создаём эффект размытия
+        self.blur_effect = QGraphicsBlurEffect()
+        self.blur_effect.setBlurRadius(15)
+        self.setGraphicsEffect(self.blur_effect)
+
+        self.update()
+        QApplication.processEvents()
+
+        # Создаём оверлей
+        self.overlay = QWidget(self)
+        self.overlay.setGeometry(self.rect())
+        self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 30);")
+        self.overlay.setCursor(Qt.ForbiddenCursor)
+        self.overlay.setObjectName("modal_overlay")
+        self.overlay.show()
+
+        # Создаём окно редактирования
+        from ui.windows.m3_0_edit_project import open_edit_project_window
+        self.edit_window = open_edit_project_window(
+            project_path=self.project_path,
+            parent=None,  # ВАЖНО: parent=None, чтобы окно не было дочерним
+            projects_path=self.paths.get('projects')
+        )
+
+        # НЕ делаем setParent() - оставляем окно независимым
+        self.edit_window.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.edit_window.setAttribute(Qt.WA_DeleteOnClose)
+
+        # Центрируем окно относительно текущего окна
+        self._centerEditWindowGlobal(self.edit_window)
+
+        # Показываем окно
+        self.edit_window.show()
+        self.edit_window.raise_()
+        self.edit_window.activateWindow()
+
+        # Подключаем сигналы
+        self.edit_window.finished.connect(self._onEditWindowFinished)
+        self.edit_window.project_updated.connect(self._onProjectUpdatedInView)
+
+    def _centerEditWindowGlobal(self, window):
+        """Центрирование окна редактирования в глобальных координатах"""
+        if not window:
             return
 
-        # Здесь будет код для открытия окна редактирования проекта
-        # ...
+        # Получаем глобальную позицию центра текущего окна
+        parent_rect = self.geometry()
+        parent_center = self.mapToGlobal(parent_rect.center())
+
+        # Вычисляем позицию для центрирования диалога
+        dialog_width = window.width()
+        dialog_height = window.height()
+
+        x = parent_center.x() - dialog_width // 2
+        y = parent_center.y() - dialog_height // 2
+
+        window.move(x, y)
+
+    def _centerEditWindow(self, window):
+        """Центрирование окна редактирования относительно родителя"""
+        if not window:
+            return
+
+        parent_widget = self.parent() if self.parent() else self
+        parent_width = parent_widget.width()
+        parent_height = parent_widget.height()
+        dialog_width = window.width()
+        dialog_height = window.height()
+
+        x = (parent_width - dialog_width) // 2
+        y = (parent_height - dialog_height) // 2
+
+        window.move(x, y)
+        window.raise_()
+
+    def _onEditWindowFinished(self):
+        """Обработчик закрытия окна редактирования"""
+        # Удаляем оверлей
+        if self.overlay:
+            self.overlay.deleteLater()
+            self.overlay = None
+
+        # Удаляем эффект размытия с родительского виджета
+        if self.parent():
+            self.parent().setGraphicsEffect(None)
+
+        self.blur_effect = None
+
+        # Очищаем ссылку на окно
+        self.edit_window = None
+
+    def _onProjectUpdatedInView(self, metadata):
+        """Обработчик обновления проекта в окне просмотра"""
+        # Обновляем метаданные
+        self.metadata = metadata
+
+        # Проверяем, изменилось ли имя папки
+        new_folder_name = metadata.get("_new_folder_name")
+        if new_folder_name and new_folder_name != os.path.basename(self.project_path):
+            # Обновляем путь к проекту
+            self.project_path = os.path.join(os.path.dirname(self.project_path), new_folder_name)
+
+            # ВАЖНО: Обновляем сохраненное имя папки в главном окне
+            if hasattr(self.parent().parent(), '_current_project_folder'):
+                self.parent().parent()._current_project_folder = new_folder_name
+
+        # Обновляем UI
+        self.updateUIfromMetadata()
+
+        # Перезагружаем главы если путь изменился
+        if new_folder_name:
+            self.loadChapters()
+            self.applySortAndFilter()
 
     def onAddChapter(self):
         # Получаем список существующих номеров глав
@@ -1342,6 +1918,51 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         self.loadChapters()
         self.applySortAndFilter()
 
+    def renameChapter(self, ch_data, new_number):
+        """
+        Переименовывает главу: обновляет папку, файл chapter.json и перезагружает список глав
+        """
+        old_folder = ch_data.get("_folder", "")
+        if not old_folder or not os.path.isdir(old_folder):
+            QMessageBox.warning(self, "Ошибка", "Папка главы не найдена.", QMessageBox.Ok)
+            return
+
+        try:
+            # Создаем новое имя папки
+            chapters_root = os.path.dirname(old_folder)
+            new_folder_name = new_number.replace(".", "_")
+            new_folder_path = os.path.join(chapters_root, new_folder_name)
+
+            # Проверяем, что новая папка не существует
+            if os.path.exists(new_folder_path):
+                QMessageBox.warning(self, "Ошибка", f"Папка для главы '{new_number}' уже существует.", QMessageBox.Ok)
+                return
+
+            # Переименовываем папку
+            os.rename(old_folder, new_folder_path)
+
+            # Обновляем данные главы
+            ch_data["chapter_number"] = new_number
+            ch_data["_folder"] = new_folder_path
+
+            # Сохраняем обновленный chapter.json
+            chapter_json_path = os.path.join(new_folder_path, "chapter.json")
+            with open(chapter_json_path, "w", encoding="utf-8") as f:
+                # Создаем копию данных без служебного поля _folder для сохранения
+                save_data = {k: v for k, v in ch_data.items() if k != "_folder"}
+                json.dump(save_data, f, ensure_ascii=False, indent=4)
+
+            print(f"Глава переименована: {ch_data.get('chapter_number')} -> {new_number}")
+
+            # Перезагружаем список глав
+            self.loadChapters()
+            self.applySortAndFilter()
+
+            QMessageBox.information(self, "Успех", f"Глава успешно переименована в '{new_number}'.", QMessageBox.Ok)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось переименовать главу: {str(e)}", QMessageBox.Ok)
+            print(f"Ошибка при переименовании главы: {e}")
     # -----------------------------------------------------------------------
     # Обработка событий окна
     # -----------------------------------------------------------------------
@@ -1350,6 +1971,10 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         super().moveEvent(event)
         if hasattr(self, 'upload_window') and self.upload_window and self.upload_window.isVisible():
             self._centerChildWindow(self.upload_window)
+
+        # Обработка окна редактирования
+        if hasattr(self, 'edit_window') and self.edit_window and self.edit_window.isVisible():
+            self._centerEditWindowGlobal(self.edit_window)
 
     def resizeEvent(self, event):
         """Обработка изменения размера окна"""
@@ -1362,6 +1987,10 @@ class ProjectDetailWindow(QWidget):  # Изменено с QMainWindow на QWid
         # Центрируем окно загрузки
         if hasattr(self, 'upload_window') and self.upload_window and self.upload_window.isVisible():
             self._centerChildWindow(self.upload_window)
+
+        # Центрируем окно редактирования
+        if hasattr(self, 'edit_window') and self.edit_window and self.edit_window.isVisible():
+            self._centerEditWindowGlobal(self.edit_window)
 
     # -----------------------------------------------------------------------
     # Вспомогательные
